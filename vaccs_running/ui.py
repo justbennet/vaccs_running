@@ -937,18 +937,3 @@ def safe_curs_set(visibility: int) -> None:
         curses.curs_set(visibility)
     except curses.error:
         pass
-
-
-def print_once(client: SlurmClient) -> None:
-    jobs = client.fetch_jobs()
-    summary = summarize_jobs(jobs)
-    print("VACC's Running?")
-    print(" ".join(f"{state}:{count}" for state, count in sorted(summary.items())) or "no jobs")
-    print()
-    print(f"{'JOBID':<16} {'STATE':<10} {'PARTITION':<14} {'ELAPSED':<10} {'LIMIT':<10} WHERE / WHY")
-    print("-" * 90)
-    for job in jobs:
-        print(
-            f"{job.job_id:<16} {job.state:<10} {job.partition:<14} "
-            f"{job.elapsed:<10} {job.limit:<10} {job.location}"
-        )
