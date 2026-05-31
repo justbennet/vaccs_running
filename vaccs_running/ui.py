@@ -55,6 +55,13 @@ class ClickRegion:
     key: int
 
 
+@dataclass(frozen=True)
+class TableRegion:
+    first_row: int = 0
+    rows: int = 0
+    width: int = 0
+
+
 class VaccsRunningApp:
     def __init__(
         self,
@@ -71,6 +78,7 @@ class VaccsRunningApp:
         )
         self.colors_enabled = False
         self.click_regions: list[ClickRegion] = []
+        self.table_region = TableRegion()
 
     def run(self) -> None:
         curses.wrapper(self._main)
@@ -237,8 +245,18 @@ class VaccsRunningApp:
                 curses.BUTTON1_CLICKED
                 | curses.BUTTON1_PRESSED
                 | curses.BUTTON1_RELEASED
+                | curses.BUTTON4_PRESSED
+                | curses.BUTTON5_PRESSED
             )
         ):
+            return True
+        if bstate & curses.BUTTON4_PRESSED:
+            self.state.selected -= 3
+            self._clamp_selection()
+            return True
+        if bstate & curses.BUTTON5_PRESSED:
+            self.state.selected += 3
+            self._clamp_selection()
             return True
         return self._handle_click(stdscr, x, y)
 
@@ -246,6 +264,21 @@ class VaccsRunningApp:
         for region in reversed(self.click_regions):
             if region.y == y and region.x_start <= x < region.x_end:
                 return self._handle_key(stdscr, region.key)
+        if self._select_table_row(x, y):
+            return True
+        return True
+
+    def _select_table_row(self, x: int, y: int) -> bool:
+        region = self.table_region
+        if x < 1 or x >= max(1, region.width - 1):
+            return False
+        if y < region.first_row or y >= region.first_row + region.rows:
+            return False
+        index = self.state.scroll + (y - region.first_row)
+        if index >= self._visible_count():
+            return False
+        self.state.selected = index
+        self._clamp_selection()
         return True
 
     def _page_size(self, stdscr: curses.window) -> int:
@@ -304,6 +337,7 @@ class VaccsRunningApp:
     def _draw(self, stdscr: curses.window) -> None:
         stdscr.erase()
         self.click_regions = []
+        self.table_region = TableRegion()
         height, width = stdscr.getmaxyx()
         self._draw_header(stdscr, width)
         if self.state.view == "nodes":
