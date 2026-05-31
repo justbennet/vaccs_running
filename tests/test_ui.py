@@ -3,7 +3,6 @@ import unittest
 
 from vaccs_running.slurm import Job, Node
 from vaccs_running.ui import (
-    ClickRegion,
     VaccsRunningApp,
     command_text,
     page_status,
@@ -120,35 +119,6 @@ class NodeFilterTests(unittest.TestCase):
 
         self.assertTrue(app._handle_key(None, ord("j")))
         self.assertEqual(app.state.view, "jobs")
-
-    def test_header_click_switches_views(self):
-        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
-        app.click_regions = [ClickRegion(y=3, x_start=10, x_end=19, key=ord("n"))]
-
-        self.assertTrue(app._handle_click(None, 12, 3))
-
-        self.assertEqual(app.state.view, "nodes")
-
-    def test_node_header_click_toggles_gpu_filter(self):
-        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
-        screen = FakeScreen()
-        app.state.view = "nodes"
-        app.state.nodes = [
-            make_node("cpu01", "(null)"),
-            make_node("gpu01", "gpu:h200:4"),
-        ]
-
-        app._draw_header(screen, 120)
-        gpu_region = next(
-            region
-            for region in app.click_regions
-            if region.key == ord("g")
-        )
-
-        self.assertTrue(app._handle_click(screen, gpu_region.x_start, gpu_region.y))
-
-        self.assertTrue(app.state.gpu_nodes_only)
-        self.assertFalse(app.state.free_gpu_only)
 
     def test_g_toggles_gpu_node_filter(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
