@@ -47,6 +47,14 @@ class AppState:
     free_gpu_only: bool = False
 
 
+@dataclass(frozen=True)
+class ClickRegion:
+    y: int
+    x_start: int
+    x_end: int
+    key: int
+
+
 class VaccsRunningApp:
     def __init__(
         self,
@@ -62,6 +70,7 @@ class VaccsRunningApp:
             view="nodes" if initial_view == "nodes" else "jobs",
         )
         self.colors_enabled = False
+        self.click_regions: list[ClickRegion] = []
 
     def run(self) -> None:
         curses.wrapper(self._main)
@@ -70,6 +79,7 @@ class VaccsRunningApp:
         safe_curs_set(0)
         stdscr.nodelay(True)
         stdscr.keypad(True)
+        safe_mouse_setup()
         self._init_colors()
         self._refresh_current()
 
@@ -174,6 +184,8 @@ class VaccsRunningApp:
             self._jump_page(stdscr, 1)
         elif key == curses.KEY_LEFT:
             self._jump_page(stdscr, -1)
+        elif key == curses.KEY_MOUSE:
+            return self._handle_mouse(stdscr)
         elif key == curses.KEY_HOME:
             self.state.selected = 0
         elif key == curses.KEY_END:
@@ -212,6 +224,28 @@ class VaccsRunningApp:
                 self._show_efficiency(stdscr)
 
         self._clamp_selection()
+        return True
+
+    def _handle_mouse(self, stdscr: curses.window) -> bool:
+        try:
+            _, x, y, _, bstate = curses.getmouse()
+        except curses.error:
+            return True
+        if bstate and not (
+            bstate
+            & (
+                curses.BUTTON1_CLICKED
+                | curses.BUTTON1_PRESSED
+                | curses.BUTTON1_RELEASED
+            )
+        ):
+            return True
+        return self._handle_click(stdscr, x, y)
+
+    def _handle_click(self, stdscr: curses.window, x: int, y: int) -> bool:
+        for region in reversed(self.click_regions):
+            if region.y == y and region.x_start <= x < region.x_end:
+                return self._handle_key(stdscr, region.key)
         return True
 
     def _page_size(self, stdscr: curses.window) -> int:
@@ -269,6 +303,7 @@ class VaccsRunningApp:
 
     def _draw(self, stdscr: curses.window) -> None:
         stdscr.erase()
+        self.click_regions = []
         height, width = stdscr.getmaxyx()
         self._draw_header(stdscr, width)
         if self.state.view == "nodes":
@@ -299,31 +334,37 @@ class VaccsRunningApp:
             self._addstr(stdscr, 1, width - len(right) - 2, right, self._pair(MUTED_PAIR))
         jobs_attr = self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD if self.state.view == "jobs" else self._pair(MUTED_PAIR)
         nodes_attr = self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD if self.state.view == "nodes" else self._pair(MUTED_PAIR)
-        self._addstr(stdscr, 3, 1, " j Jobs ", jobs_attr)
-        self._addstr(stdscr, 3, 10, " n Nodes ", nodes_attr)
+        self._draw_clickable(stdscr, 3, 1, " j Jobs ", jobs_attr, ord("j"))
+        self._draw_clickable(stdscr, 3, 10, " n Nodes ", nodes_attr, ord("n"))
         if self.state.view == "nodes":
             x = 21
             gpu_filter_text = " g gpu-nodes "
-            self._addstr(
+            self._draw_clickable(
                 stdscr,
                 3,
                 x,
                 gpu_filter_text,
                 self._pair(ACTIVE_TAB_PAIR if self.state.gpu_nodes_only else MUTED_PAIR),
+                ord("g"),
             )
             x += len(gpu_filter_text) + 1
             free_filter_text = " f free-gpu "
-            self._addstr(
+            self._draw_clickable(
                 stdscr,
                 3,
                 x,
                 free_filter_text,
                 self._pair(ACTIVE_TAB_PAIR if self.state.free_gpu_only else MUTED_PAIR),
+                ord("f"),
             )
             x += len(free_filter_text) + 1
-            self._addstr(stdscr, 3, x, " d detail  p peek  q quit", self._pair(MUTED_PAIR))
+            x = self._draw_clickable(stdscr, 3, x, " d detail ", self._pair(MUTED_PAIR), ord("d")) + 1
+            x = self._draw_clickable(stdscr, 3, x, " p peek ", self._pair(MUTED_PAIR), ord("p")) + 1
+            self._draw_clickable(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR), ord("q"))
         else:
-            self._addstr(stdscr, 3, 21, " d detail  q quit", self._pair(MUTED_PAIR))
+            x = 21
+            x = self._draw_clickable(stdscr, 3, x, " d detail ", self._pair(MUTED_PAIR), ord("d")) + 1
+            self._draw_clickable(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR), ord("q"))
 
     def _draw_jobs_table(
         self,
@@ -640,6 +681,24 @@ class VaccsRunningApp:
         except curses.error:
             pass
 
+    def _draw_clickable(
+        self,
+        win: curses.window,
+        y: int,
+        x: int,
+        text: str,
+        attr: int,
+        key: int,
+    ) -> int:
+        self._addstr(win, y, x, text, attr)
+        _, max_x = win.getmaxyx()
+        if y >= 0 and x < max_x:
+            x_start = max(0, x)
+            x_end = min(max_x, x + len(text))
+            if x_start < x_end:
+                self.click_regions.append(ClickRegion(y, x_start, x_end, key))
+        return x + len(text)
+
     def _addch(
         self,
         win: curses.window,
@@ -935,5 +994,17 @@ def fit_columns(
 def safe_curs_set(visibility: int) -> None:
     try:
         curses.curs_set(visibility)
+    except curses.error:
+        pass
+
+
+def safe_mouse_setup() -> None:
+    try:
+        curses.mousemask(
+            curses.BUTTON1_CLICKED
+            | curses.BUTTON1_PRESSED
+            | curses.BUTTON1_RELEASED
+        )
+        curses.mouseinterval(0)
     except curses.error:
         pass
