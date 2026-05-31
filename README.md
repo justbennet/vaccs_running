@@ -1,8 +1,8 @@
 # VACC's Running?
 
-A colorful terminal UI for checking your jobs on the Vermont Advanced Computing Cluster.
+A colorful terminal UI for checking your jobs on the Vermont Advanced Computing Cluster and viewing the node availability.
 
-> This project is not affiliated in any way with UVM, VACC, or the Complex Systems Center.
+> This project is not affiliated in any way with UVM, VACC, or the Vermont Complex Systems Institute.
 
 ## Quick Start
 
