@@ -30,8 +30,11 @@ NODE_COLORS = {
 BORDER_PAIR = 9
 TEXT_PAIR = 10
 ACTIVE_TAB_PAIR = 11
+TITLE_PAIR = 12
 MUTED_PAIR = 13
 SURFACE_PAIR = 14
+MIN_TERMINAL_WIDTH = 70
+MIN_TERMINAL_HEIGHT = 16
 
 
 @dataclass
@@ -94,6 +97,8 @@ class VaccsRunningApp:
             curses.start_color()
             curses.use_default_colors()
             orange = self._orange_color()
+            grid = self._grid_color()
+            title = self._title_color()
             curses.init_pair(1, curses.COLOR_GREEN, -1)
             curses.init_pair(2, curses.COLOR_YELLOW, -1)
             curses.init_pair(3, curses.COLOR_CYAN, -1)
@@ -102,23 +107,42 @@ class VaccsRunningApp:
             curses.init_pair(6, orange, -1)
             curses.init_pair(7, curses.COLOR_BLACK, orange)
             curses.init_pair(8, curses.COLOR_WHITE, curses.COLOR_RED)
-            curses.init_pair(BORDER_PAIR, orange, -1)
+            curses.init_pair(BORDER_PAIR, grid, -1)
             curses.init_pair(TEXT_PAIR, curses.COLOR_WHITE, -1)
             curses.init_pair(ACTIVE_TAB_PAIR, curses.COLOR_BLACK, orange)
+            curses.init_pair(TITLE_PAIR, title, -1)
             curses.init_pair(MUTED_PAIR, curses.COLOR_WHITE, -1)
             curses.init_pair(SURFACE_PAIR, curses.COLOR_WHITE, -1)
             self.colors_enabled = True
         except curses.error:
             self.colors_enabled = False
 
+    def _custom_color(self, slot: int, red: int, green: int, blue: int) -> int | None:
+        if curses.COLORS <= slot or not curses.can_change_color():
+            return None
+        try:
+            curses.init_color(slot, red, green, blue)
+            return slot
+        except curses.error:
+            return None
+
     def _orange_color(self) -> int:
-        if curses.COLORS > 16 and curses.can_change_color():
-            try:
-                curses.init_color(16, 851, 467, 341)  # #D97757
-                return 16
-            except curses.error:
-                pass
+        custom = self._custom_color(16, 851, 467, 341)  # #D97757
+        if custom is not None:
+            return custom
         return 173 if curses.COLORS > 173 else curses.COLOR_YELLOW
+
+    def _grid_color(self) -> int:
+        custom = self._custom_color(17, 863, 345, 165)  # #DC582A
+        if custom is not None:
+            return custom
+        return curses.COLOR_WHITE
+
+    def _title_color(self) -> int:
+        custom = self._custom_color(18, 969, 969, 969)  # #F7F7F7
+        if custom is not None:
+            return custom
+        return curses.COLOR_WHITE
 
     def _refresh_current(self) -> None:
         if self.state.view == "nodes":
@@ -207,9 +231,6 @@ class VaccsRunningApp:
         elif key == ord("p"):
             if self.state.view == "nodes":
                 self._show_node_jobs(stdscr)
-        elif key == ord("e"):
-            if self.state.view == "jobs":
-                self._show_efficiency(stdscr)
 
         self._clamp_selection()
         return True
@@ -270,6 +291,10 @@ class VaccsRunningApp:
     def _draw(self, stdscr: curses.window) -> None:
         stdscr.erase()
         height, width = stdscr.getmaxyx()
+        if terminal_too_small(width, height):
+            self._draw_terminal_too_small(stdscr, width, height)
+            stdscr.refresh()
+            return
         self._draw_header(stdscr, width)
         if self.state.view == "nodes":
             self._draw_nodes_table(stdscr, self._visible_nodes(), height, width)
@@ -279,30 +304,44 @@ class VaccsRunningApp:
             self._draw_job_detail(stdscr, height, width)
         stdscr.refresh()
 
+    def _draw_terminal_too_small(
+        self,
+        stdscr: curses.window,
+        width: int,
+        height: int,
+    ) -> None:
+        lines = [
+            ("Terminal size too small:", curses.A_BOLD),
+            (f"Width = {width} Height = {height}", curses.A_BOLD),
+            ("", 0),
+            ("Needed for current config:", curses.A_BOLD),
+            (
+                f"Width = {MIN_TERMINAL_WIDTH} Height = {MIN_TERMINAL_HEIGHT}",
+                curses.A_BOLD,
+            ),
+        ]
+        top = max(0, (height - len(lines)) // 2)
+        for offset, (line, attr) in enumerate(lines):
+            if not line:
+                continue
+            x = max(0, (width - len(line)) // 2)
+            self._addstr(stdscr, top + offset, x, line, self._pair(MUTED_PAIR) | attr)
+
     def _draw_header(self, stdscr: curses.window, width: int) -> None:
         title = " VACC's Running? "
-        clock = time.strftime("%H:%M:%S")
-        right = f"refresh {self.refresh_seconds:.2f}s  {clock}"
+        right = time.strftime("%H:%M:%S")
         self._draw_box(stdscr, 0, 0, 3, width)
 
-        job_summary = summarize_jobs(self.state.jobs)
-        node_summary = summarize_nodes(self.state.nodes)
-        jobs = compact_summary(job_summary, ["RUNNING", "PENDING", "FAILED", "CANCELLED"])
-        nodes = compact_summary(node_summary, ["IDLE", "MIXED", "ALLOCATED", "DOWN"])
-        meta = f" jobs {jobs or 'none'}"
-        if nodes:
-            meta += f"   nodes {nodes}"
-        self._addstr(stdscr, 1, 2, meta[: max(0, width - 4)], self._pair(MUTED_PAIR))
-        title_x = max(1, (width - len(title)) // 2)
-        self._addstr(stdscr, 1, title_x, title[: max(0, width - 2)], self._pair(5) | curses.A_BOLD)
-        if width > len(right) + 2:
-            self._addstr(stdscr, 1, width - len(right) - 2, right, self._pair(MUTED_PAIR))
         jobs_attr = self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD if self.state.view == "jobs" else self._pair(MUTED_PAIR)
         nodes_attr = self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD if self.state.view == "nodes" else self._pair(MUTED_PAIR)
-        self._addstr(stdscr, 3, 1, " j Jobs ", jobs_attr)
-        self._addstr(stdscr, 3, 10, " n Nodes ", nodes_attr)
+        self._addstr(stdscr, 1, 2, " j Jobs ", jobs_attr)
+        self._addstr(stdscr, 1, 11, " n Nodes ", nodes_attr)
+        title_x = max(1, (width - len(title)) // 2)
+        self._addstr(stdscr, 1, title_x, title[: max(0, width - 2)], self._pair(TITLE_PAIR) | curses.A_BOLD)
+        if width > len(right) + 2:
+            self._addstr(stdscr, 1, width - len(right) - 2, right, self._pair(MUTED_PAIR))
         if self.state.view == "nodes":
-            x = 21
+            x = 1
             gpu_filter_text = " g gpu-nodes "
             self._addstr(
                 stdscr,
@@ -327,7 +366,7 @@ class VaccsRunningApp:
             x += len(" p peek ") + 1
             self._addstr(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR))
         else:
-            x = 21
+            x = 1
             self._addstr(stdscr, 3, x, " d detail ", self._pair(MUTED_PAIR))
             x += len(" d detail ") + 1
             self._addstr(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR))
@@ -342,43 +381,32 @@ class VaccsRunningApp:
         table_top = 5
         detail_height = min(8, max(4, height // 4))
         table_height = max(4, height - detail_height - table_top)
-        self._draw_box(stdscr, table_top, 0, table_height, width, " jobs ")
+        title = status_title(
+            "Jobs",
+            summarize_jobs(self.state.jobs),
+            ["RUNNING", "PENDING", "FAILED", "CANCELLED"],
+        )
+        self._draw_box(stdscr, table_top, 0, table_height, width, title)
         header_y = table_top + 1
         first_row = table_top + 2
         rows = max(0, table_height - 3)
+        available_width = max(1, width - 4)
+        job_specs = responsive_job_specs(available_width)
         row_values = [
-            [
-                job.job_id,
-                job.state,
-                job.partition,
-                job.elapsed,
-                job.limit,
-                job.cpus,
-                job.location,
-            ]
+            [value_fn(job) for _, _, _, value_fn in job_specs]
             for job in visible
         ]
         columns = fit_columns(
             [
-                ("JOBID", 10, 22),
-                ("STATE", 8, 14),
-                ("PARTITION", 10, 22),
-                ("ELAPSED", 8, 14),
-                ("LIMIT", 8, 14),
-                ("CPUS", 4, 8),
-                ("WHERE / WHY", 18, 56),
+                (label, min_width, max_width)
+                for label, min_width, max_width, _ in job_specs
             ],
             row_values,
-            max(1, width - 4),
+            available_width,
         )
         headers = [
-            ("JOBID", columns[0]),
-            ("STATE", columns[1]),
-            ("PARTITION", columns[2]),
-            ("ELAPSED", columns[3]),
-            ("LIMIT", columns[4]),
-            ("CPUS", columns[5]),
-            ("WHERE / WHY", columns[6]),
+            (label, column_width)
+            for (label, _, _, _), column_width in zip(job_specs, columns)
         ]
         x = 2
         for label, size in headers:
@@ -410,13 +438,8 @@ class VaccsRunningApp:
             if index == self.state.selected:
                 attr |= curses.A_REVERSE
             cells = [
-                (job.job_id, columns[0]),
-                (job.state, columns[1]),
-                (job.partition, columns[2]),
-                (job.elapsed, columns[3]),
-                (job.limit, columns[4]),
-                (job.cpus, columns[5]),
-                (job.location, columns[6]),
+                (value_fn(job), column_width)
+                for (_, _, _, value_fn), column_width in zip(job_specs, columns)
             ]
             x = 2
             for value, size in cells:
@@ -435,11 +458,16 @@ class VaccsRunningApp:
         table_top = 5
         detail_height = min(8, max(4, height // 4))
         table_height = max(4, height - detail_height - table_top)
-        self._draw_box(stdscr, table_top, 0, table_height, width, " nodes ")
+        title = status_title(
+            "Nodes",
+            summarize_nodes(self.state.nodes),
+            ["IDLE", "MIXED", "ALLOCATED", "DOWN"],
+        )
+        self._draw_box(stdscr, table_top, 0, table_height, width, title)
         header_y = table_top + 1
         first_row = table_top + 2
         rows = max(0, table_height - 3)
-        row_values = []
+        available_width = max(1, width - 4)
         cpu_count_width = resource_count_width(
             [(node.cpu_alloc, node.cpu_total) for node in visible]
         )
@@ -447,36 +475,7 @@ class VaccsRunningApp:
         memory_count_width = resource_text_width(
             [node.memory_text for node in visible]
         )
-        for node in visible:
-            gpu_percent = pct(node.gpu_alloc, node.gpu_total)
-            row_values.append(
-                [
-                    node.name,
-                    node.state,
-                    node.partitions,
-                    resource_meter(
-                        node.cpu_alloc,
-                        node.cpu_total,
-                        node.cpu_percent,
-                        meter_width=16,
-                        count_width=cpu_count_width,
-                    ),
-                    resource_text_meter(
-                        node.memory_text,
-                        node.memory_percent,
-                        meter_width=14,
-                        count_width=memory_count_width,
-                    ),
-                    resource_text_meter(
-                        node.gpu_text,
-                        gpu_percent,
-                        meter_width=12,
-                        count_width=gpu_count_width,
-                    ),
-                    node.gres,
-                ]
-            )
-        columns = fit_columns(
+        show_resource_bars = available_width >= minimum_table_width(
             [
                 ("NODE", 10, 22),
                 ("STATE", 8, 18),
@@ -485,18 +484,65 @@ class VaccsRunningApp:
                 ("MEM", 24, 38),
                 ("GPU", 18, 30),
                 ("GRES", 12, 48),
-            ],
+            ]
+        )
+        node_specs = responsive_node_specs(
+            show_resource_bars,
+            cpu_count_width,
+            memory_count_width,
+            gpu_count_width,
+        )
+        row_values = []
+        for node in visible:
+            gpu_percent = pct(node.gpu_alloc, node.gpu_total)
+            if show_resource_bars:
+                row_values.append(
+                    [
+                        node.name,
+                        node.state,
+                        node.partitions,
+                        resource_meter(
+                            node.cpu_alloc,
+                            node.cpu_total,
+                            node.cpu_percent,
+                            meter_width=16,
+                            count_width=cpu_count_width,
+                        ),
+                        resource_text_meter(
+                            node.memory_text,
+                            node.memory_percent,
+                            meter_width=14,
+                            count_width=memory_count_width,
+                        ),
+                        resource_text_meter(
+                            node.gpu_text,
+                            gpu_percent,
+                            meter_width=12,
+                            count_width=gpu_count_width,
+                        ),
+                        node.gres,
+                    ]
+                )
+            else:
+                row_values.append(
+                    [
+                        node.name,
+                        node.state,
+                        node.partitions,
+                        f"{node.cpu_alloc}/{node.cpu_total}",
+                        node.memory_text,
+                        node.gpu_text,
+                        node.gres,
+                    ]
+                )
+        columns = fit_columns(
+            node_specs,
             row_values,
-            max(1, width - 4),
+            available_width,
         )
         headers = [
-            ("NODE", columns[0]),
-            ("STATE", columns[1]),
-            ("PARTITION", columns[2]),
-            ("CPU", columns[3]),
-            ("MEM", columns[4]),
-            ("GPU", columns[5]),
-            ("GRES", columns[6]),
+            (label, column_width)
+            for (label, _, _), column_width in zip(node_specs, columns)
         ]
         x = 2
         for label, size in headers:
@@ -528,11 +574,11 @@ class VaccsRunningApp:
             if index == self.state.selected:
                 attr |= curses.A_REVERSE
             gpu_percent = pct(node.gpu_alloc, node.gpu_total)
-            cells = [
-                (node.name, columns[0]),
-                (node.state, columns[1]),
-                (node.partitions, columns[2]),
-                (
+            if show_resource_bars:
+                values = [
+                    node.name,
+                    node.state,
+                    node.partitions,
                     resource_meter(
                         node.cpu_alloc,
                         node.cpu_total,
@@ -540,28 +586,31 @@ class VaccsRunningApp:
                         meter_width=16,
                         count_width=cpu_count_width,
                     ),
-                    columns[3],
-                ),
-                (
                     resource_text_meter(
                         node.memory_text,
                         node.memory_percent,
                         meter_width=14,
                         count_width=memory_count_width,
                     ),
-                    columns[4],
-                ),
-                (
                     resource_text_meter(
                         node.gpu_text,
                         gpu_percent,
                         meter_width=12,
                         count_width=gpu_count_width,
                     ),
-                    columns[5],
-                ),
-                (node.gres, columns[6]),
-            ]
+                    node.gres,
+                ]
+            else:
+                values = [
+                    node.name,
+                    node.state,
+                    node.partitions,
+                    f"{node.cpu_alloc}/{node.cpu_total}",
+                    node.memory_text,
+                    node.gpu_text,
+                    node.gres,
+                ]
+            cells = list(zip(values, columns))
             x = 2
             for value, size in cells:
                 text = value[:size].ljust(size)
@@ -584,9 +633,16 @@ class VaccsRunningApp:
             f"submitted={job.submit_time}  started={job.start_time}  reason={job.reason}",
             f"resources: nodes={job.node_count}  cpus={job.cpus}  gres={job.gres}",
         ]
-        for offset, line in enumerate(lines):
-            if top + 1 + offset < height - 1:
-                self._addstr(stdscr, top + 1 + offset, 2, line[: max(0, width - 4)], self._state_attr(job.state))
+        body_rows = max(0, min(height - 1, top + panel_height - 1) - top - 1)
+        wrapped = wrap_detail_lines(lines, max(1, width - 4))
+        for offset, line in enumerate(wrapped[:body_rows]):
+            self._addstr(
+                stdscr,
+                top + 1 + offset,
+                2,
+                line,
+                self._state_attr(job.state),
+            )
 
     def _draw_node_detail(self, stdscr: curses.window, height: int, width: int) -> None:
         panel_height = min(8, max(4, height // 4))
@@ -611,9 +667,16 @@ class VaccsRunningApp:
             f"gpu alloc={node.gpu_text} free={node.gpu_free}  {meter(gpu_percent, 18)}  tres={node.alloc_tres or '-'}",
             f"features={node.features}",
         ]
-        for offset, line in enumerate(lines):
-            if top + 1 + offset < height - 1:
-                self._addstr(stdscr, top + 1 + offset, 2, line[: max(0, width - 4)], self._node_attr(node))
+        body_rows = max(0, min(height - 1, top + panel_height - 1) - top - 1)
+        wrapped = wrap_detail_lines(lines, max(1, width - 4))
+        for offset, line in enumerate(wrapped[:body_rows]):
+            self._addstr(
+                stdscr,
+                top + 1 + offset,
+                2,
+                line,
+                self._node_attr(node),
+            )
 
     def _state_attr(self, state: str) -> int:
         return self._pair(STATE_COLORS.get(state.upper(), 3))
@@ -638,28 +701,10 @@ class VaccsRunningApp:
         if y < 0 or y >= max_y or x < 0 or x >= max_x:
             return
         width = max_x - x
-        if y == max_y - 1:
-            width -= 1
         if width <= 0:
             return
         try:
             win.addstr(y, x, text[:width], attr)
-        except curses.error:
-            pass
-
-    def _addch(
-        self,
-        win: curses.window,
-        y: int,
-        x: int,
-        ch: int,
-        attr: int = 0,
-    ) -> None:
-        max_y, max_x = win.getmaxyx()
-        if y < 0 or y >= max_y or x < 0 or x >= max_x:
-            return
-        try:
-            win.addch(y, x, ch, attr)
         except curses.error:
             pass
 
@@ -724,18 +769,6 @@ class VaccsRunningApp:
             self.client.node_jobs,
             node.name,
             close_keys=(ord("p"),),
-        )
-
-    def _show_efficiency(self, stdscr: curses.window) -> None:
-        job = self._selected_job()
-        if not job:
-            return
-        self._popup_command(
-            stdscr,
-            f"my_job_statistics {job.job_id}",
-            self.client.job_statistics,
-            job.job_id,
-            close_keys=(ord("e"),),
         )
 
     def _popup_command(
@@ -827,6 +860,21 @@ def wrap_lines(text: str, width: int) -> list[str]:
     return lines
 
 
+def wrap_detail_lines(lines: list[str], width: int) -> list[str]:
+    wrapped: list[str] = []
+    for line in lines:
+        wrapped.extend(
+            textwrap.wrap(
+                line,
+                width=max(1, width),
+                subsequent_indent="  ",
+                replace_whitespace=False,
+            )
+            or [""]
+        )
+    return wrapped
+
+
 def popup_geometry(
     screen_height: int,
     screen_width: int,
@@ -847,17 +895,18 @@ def popup_geometry(
     return top, left, box_height, box_width
 
 
-def compact_summary(summary: dict[str, int], preferred: list[str]) -> str:
+def status_title(label: str, summary: dict[str, int], preferred: list[str]) -> str:
     bits: list[str] = []
     seen: set[str] = set()
     for key in preferred:
         if summary.get(key):
-            bits.append(f"{key[:4]}:{summary[key]}")
+            bits.append(f"{key}:{summary[key]}")
             seen.add(key)
     for key, value in sorted(summary.items()):
         if key not in seen and value:
-            bits.append(f"{key[:4]}:{value}")
-    return " ".join(bits)
+            bits.append(f"{key}:{value}")
+    suffix = " ".join(bits) if bits else "none"
+    return f" {label}: {suffix} "
 
 
 def meter(percent: float, width: int) -> str:
@@ -909,6 +958,75 @@ def page_status(selected: int, total_items: int, page_size: int) -> str:
     page_count = (total_items + page_size - 1) // page_size
     current_page = min(page_count, max(0, selected) // page_size + 1)
     return f"{current_page}/{page_count}"
+
+
+def terminal_too_small(width: int, height: int) -> bool:
+    return width < MIN_TERMINAL_WIDTH or height < MIN_TERMINAL_HEIGHT
+
+
+def responsive_job_specs(
+    available_width: int,
+) -> list[tuple[str, int, int, Callable[[Job], str]]]:
+    specs: list[tuple[str, int, int, Callable[[Job], str]]] = [
+        ("JOBID", 10, 22, lambda job: job.job_id),
+        ("STATE", 8, 14, lambda job: job.state),
+        ("PARTITION", 10, 22, lambda job: job.partition),
+        ("ELAPSED", 8, 14, lambda job: job.elapsed),
+        ("LIMIT", 8, 14, lambda job: job.limit),
+        ("CPUS", 4, 8, lambda job: job.cpus),
+        ("WHERE / WHY", 18, 56, lambda job: job.location),
+    ]
+    if minimum_table_width(label_widths(specs)) <= available_width:
+        return specs
+
+    specs = [spec for spec in specs if spec[0] != "LIMIT"]
+    if minimum_table_width(label_widths(specs)) <= available_width:
+        return specs
+
+    return [spec for spec in specs if spec[0] != "CPUS"]
+
+
+def responsive_node_specs(
+    show_resource_bars: bool,
+    cpu_count_width: int,
+    memory_count_width: int,
+    gpu_count_width: int,
+) -> list[tuple[str, int, int]]:
+    if show_resource_bars:
+        return [
+            ("NODE", 10, 22),
+            ("STATE", 8, 18),
+            ("PARTITION", 10, 22),
+            ("CPU", 24, 38),
+            ("MEM", 24, 38),
+            ("GPU", 18, 30),
+            ("GRES", 12, 48),
+        ]
+
+    cpu_width = max(4, cpu_count_width)
+    memory_width = max(4, memory_count_width)
+    gpu_width = max(3, gpu_count_width)
+    return [
+        ("NODE", 10, 22),
+        ("STATE", 8, 18),
+        ("PARTITION", 10, 22),
+        ("CPU", cpu_width, max(cpu_width, 8)),
+        ("MEM", memory_width, max(memory_width, 12)),
+        ("GPU", gpu_width, max(gpu_width, 8)),
+        ("GRES", 12, 48),
+    ]
+
+
+def label_widths(
+    specs: list[tuple[str, int, int, Callable[[Job], str]]],
+) -> list[tuple[str, int, int]]:
+    return [(label, min_width, max_width) for label, min_width, max_width, _ in specs]
+
+
+def minimum_table_width(specs: list[tuple[str, int, int]]) -> int:
+    if not specs:
+        return 0
+    return sum(min_width for _, min_width, _ in specs) + len(specs) - 1
 
 
 def fit_columns(

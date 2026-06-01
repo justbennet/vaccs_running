@@ -11,6 +11,9 @@ from vaccs_running.ui import (
     resource_meter,
     resource_text_meter,
     resource_text_width,
+    status_title,
+    terminal_too_small,
+    wrap_detail_lines,
 )
 
 
@@ -30,12 +33,20 @@ class FakeScreen:
         self.height = height
         self.width = width
         self.writes = []
+        self.erase_count = 0
+        self.refresh_count = 0
 
     def getmaxyx(self):
         return self.height, self.width
 
     def addstr(self, y, x, text, attr=0):
         self.writes.append((y, x, text, attr))
+
+    def erase(self):
+        self.erase_count += 1
+
+    def refresh(self):
+        self.refresh_count += 1
 
 
 class FakePopupWindow(FakeScreen):
@@ -73,10 +84,10 @@ class FakePopupWindow(FakeScreen):
         self.positions.append((top, left))
 
 
-def make_node(name, gres, alloc_tres=""):
+def make_node(name, gres, alloc_tres="", state="IDLE"):
     return Node(
         name=name,
-        state="IDLE",
+        state=state,
         partitions="nvgpu",
         cpu_alloc=0,
         cpu_total=1,
@@ -90,11 +101,11 @@ def make_node(name, gres, alloc_tres=""):
     )
 
 
-def make_job(job_id):
+def make_job(job_id, state="RUNNING"):
     return Job(
         job_id=job_id,
         name="job",
-        state="RUNNING",
+        state=state,
         partition="nvgpu",
         nodes="h2node01",
         reason="",
@@ -109,6 +120,153 @@ def make_job(job_id):
 
 
 class NodeFilterTests(unittest.TestCase):
+    def test_header_draws_jobs_and_nodes_tabs_on_top_bar_left(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        screen = FakeScreen(height=12, width=100)
+
+        app._draw_header(screen, 100)
+
+        self.assertIn((1, 2, " j Jobs ", curses.A_BOLD), screen.writes)
+        self.assertIn((1, 11, " n Nodes ", 0), screen.writes)
+
+    def test_header_does_not_show_refresh_interval(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0.25)
+        screen = FakeScreen(height=12, width=100)
+
+        app._draw_header(screen, 100)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertNotIn("refresh", written)
+        self.assertNotIn("0.25s", written)
+
+    def test_terminal_too_small_uses_minimum_size(self):
+        self.assertTrue(terminal_too_small(69, 32))
+        self.assertTrue(terminal_too_small(70, 15))
+        self.assertFalse(terminal_too_small(70, 16))
+
+    def test_draw_shows_terminal_too_small_message(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        screen = FakeScreen(height=32, width=69)
+
+        app._draw(screen)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("Terminal size too small:", written)
+        self.assertIn("Width = 69 Height = 32", written)
+        self.assertIn("Needed for current config:", written)
+        self.assertIn("Width = 70 Height = 16", written)
+        self.assertNotIn("VACC's Running?", written)
+        self.assertEqual(screen.refresh_count, 1)
+
+    def test_status_title_uses_full_state_names(self):
+        self.assertEqual(
+            status_title(
+                "Jobs",
+                {"RUNNING": 2, "PENDING": 1, "FAILED": 1},
+                ["RUNNING", "PENDING", "FAILED"],
+            ),
+            " Jobs: RUNNING:2 PENDING:1 FAILED:1 ",
+        )
+        self.assertEqual(status_title("Nodes", {}, ["IDLE"]), " Nodes: none ")
+
+    def test_detail_lines_wrap_with_indent(self):
+        wrapped = wrap_detail_lines(
+            ["submitted=2026-05-31T10:04:06  started=2026-05-31T11:00:00"],
+            width=36,
+        )
+
+        self.assertEqual(
+            wrapped,
+            ["submitted=2026-05-31T10:04:06", "  started=2026-05-31T11:00:00"],
+        )
+
+    def test_box_draws_bottom_right_corner(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        screen = FakeScreen(height=6, width=20)
+
+        app._draw_box(screen, 2, 0, 4, screen.width, " selected job ")
+
+        self.assertIn((5, 19, "╯", curses.A_DIM), screen.writes)
+
+    def test_jobs_table_title_includes_overall_job_status(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.jobs = [
+            make_job("1", "RUNNING"),
+            make_job("2", "RUNNING"),
+            make_job("3", "PENDING"),
+        ]
+        screen = FakeScreen(height=40, width=140)
+
+        app._draw_jobs_table(screen, app._visible_jobs(), screen.height, screen.width)
+
+        self.assertIn(
+            (5, 2, " Jobs: RUNNING:2 PENDING:1 ", curses.A_BOLD),
+            screen.writes,
+        )
+
+    def test_jobs_table_hides_limit_before_cpus_when_narrow(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.jobs = [make_job("1")]
+        screen = FakeScreen(height=40, width=70)
+
+        app._draw_jobs_table(screen, app._visible_jobs(), screen.height, screen.width)
+
+        written = " ".join(write[2].strip() for write in screen.writes)
+        self.assertNotIn("LIMIT", written)
+        self.assertIn("CPUS", written)
+
+    def test_jobs_table_then_hides_cpus_when_narrower(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.jobs = [make_job("1")]
+        screen = FakeScreen(height=40, width=62)
+
+        app._draw_jobs_table(screen, app._visible_jobs(), screen.height, screen.width)
+
+        written = " ".join(write[2].strip() for write in screen.writes)
+        self.assertNotIn("LIMIT", written)
+        self.assertNotIn("CPUS", written)
+
+    def test_nodes_table_title_includes_overall_node_status(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.nodes = [
+            make_node("node01", "(null)", state="IDLE"),
+            make_node("node02", "(null)", state="MIXED"),
+            make_node("node03", "(null)", state="ALLOCATED"),
+        ]
+        screen = FakeScreen(height=40, width=140)
+
+        app._draw_nodes_table(screen, app._visible_nodes(), screen.height, screen.width)
+
+        self.assertIn(
+            (5, 2, " Nodes: IDLE:1 MIXED:1 ALLOCATED:1 ", curses.A_BOLD),
+            screen.writes,
+        )
+
+    def test_nodes_table_removes_resource_bars_when_narrow(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.nodes = [make_node("node01", "gpu:h200:4", "gres/gpu=1")]
+        screen = FakeScreen(height=40, width=100)
+
+        app._draw_nodes_table(screen, app._visible_nodes(), screen.height, screen.width)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertNotIn("[", written)
+        self.assertNotIn("]", written)
+        self.assertIn("0/1", written)
+        self.assertIn("0M/1M", written)
+        self.assertIn("1/4", written)
+
+    def test_nodes_table_keeps_resource_bars_when_wide(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.nodes = [make_node("node01", "gpu:h200:4", "gres/gpu=1")]
+        screen = FakeScreen(height=40, width=140)
+
+        app._draw_nodes_table(screen, app._visible_nodes(), screen.height, screen.width)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("[", written)
+        self.assertIn("]", written)
+
     def test_j_and_n_switch_main_views(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
 

@@ -202,15 +202,6 @@ class SlurmClient:
         jobs = [parse_node_job_line(line) for line in body.splitlines() if line.strip()]
         return format_node_jobs(jobs)
 
-    def job_statistics(self, job_id: str) -> str:
-        try:
-            return self.runner.run(["my_job_statistics", job_id], timeout=20.0)
-        except SlurmError as first_error:
-            try:
-                return self.runner.run(["seff", job_id], timeout=20.0)
-            except SlurmError:
-                raise first_error
-
 
 def parse_squeue_line(line: str) -> Job:
     parts = line.rstrip("\n").split("|")
