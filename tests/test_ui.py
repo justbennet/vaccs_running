@@ -27,6 +27,9 @@ class FakeClient:
     def node_jobs(self, node_name):
         return f"jobs for {node_name}"
 
+    def cluster_usage(self):
+        return "usage by user"
+
 
 class FakeScreen:
     def __init__(self, height=64, width=120):
@@ -355,6 +358,47 @@ class NodeFilterTests(unittest.TestCase):
             [("squeue -a -w h2node01", "jobs for h2node01", (ord("p"),))],
         )
 
+    def test_nodes_header_shows_usage_shortcut(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="nodes")
+        screen = FakeScreen(height=12, width=120)
+
+        app._draw_header(screen, 120)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn(" i usage ", written)
+
+    def test_i_opens_cluster_usage_from_nodes_view(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        calls = []
+        app.state.view = "nodes"
+        app.state.nodes = [make_node("h2node01", "gpu:h200:4")]
+        app._popup = (
+            lambda stdscr, title, text, close_keys=(), refresh_while_open=True: calls.append(
+                (title, text, close_keys, refresh_while_open)
+            )
+        )
+
+        self.assertTrue(app._handle_key(None, ord("i")))
+
+        self.assertEqual(
+            calls,
+            [("running usage by user", "usage by user", (ord("i"),), True)],
+        )
+
+    def test_i_is_nodes_only(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        calls = []
+        app.state.view = "jobs"
+        app._popup = (
+            lambda stdscr, title, text, close_keys=(), refresh_while_open=True: calls.append(
+                (title, text, close_keys, refresh_while_open)
+            )
+        )
+
+        self.assertTrue(app._handle_key(None, ord("i")))
+
+        self.assertEqual(calls, [])
+
     def test_popup_command_passes_close_keys_to_popup(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
         calls = []
@@ -402,6 +446,65 @@ class NodeFilterTests(unittest.TestCase):
 
         self.assertEqual(calls, ["call", "call"])
         self.assertEqual(background_calls, ["refresh", "draw"])
+        self.assertGreaterEqual(popup.refresh_count, 2)
+
+    def test_popup_refreshes_background_for_static_text(self):
+        import vaccs_running.ui as ui
+
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0.25)
+        screen = FakeScreen(height=40, width=120)
+        popup = FakePopupWindow(keys=[-1, ord("q")])
+        background_calls = []
+        times = [0.0, 0.0, 0.30]
+        original_newwin = curses.newwin
+        original_monotonic = ui.time.monotonic
+        original_sleep = ui.time.sleep
+        try:
+            curses.newwin = lambda height, width, top, left: popup
+            ui.time.monotonic = lambda: times.pop(0) if times else 0.30
+            ui.time.sleep = lambda seconds: None
+            app._refresh_current = lambda: background_calls.append("refresh")
+            app._draw = lambda stdscr: background_calls.append("draw")
+            app._popup(screen, "title", "snapshot")
+        finally:
+            curses.newwin = original_newwin
+            ui.time.monotonic = original_monotonic
+            ui.time.sleep = original_sleep
+
+        self.assertEqual(background_calls, ["refresh", "draw"])
+        self.assertGreaterEqual(popup.refresh_count, 2)
+
+    def test_popup_can_disable_live_refresh(self):
+        import vaccs_running.ui as ui
+
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0.25)
+        screen = FakeScreen(height=40, width=120)
+        popup = FakePopupWindow(keys=[-1, ord("q")])
+        calls = []
+        background_calls = []
+        times = [0.0, 0.0, 0.30]
+        original_newwin = curses.newwin
+        original_monotonic = ui.time.monotonic
+        original_sleep = ui.time.sleep
+        try:
+            curses.newwin = lambda height, width, top, left: popup
+            ui.time.monotonic = lambda: times.pop(0) if times else 0.30
+            ui.time.sleep = lambda seconds: None
+            app._refresh_current = lambda: background_calls.append("refresh")
+            app._draw = lambda stdscr: background_calls.append("draw")
+            app._popup(
+                screen,
+                "title",
+                lambda: calls.append("call") or f"text {len(calls)}",
+                refresh_while_open=False,
+            )
+        finally:
+            curses.newwin = original_newwin
+            ui.time.monotonic = original_monotonic
+            ui.time.sleep = original_sleep
+
+        self.assertEqual(calls, ["call"])
+        self.assertEqual(background_calls, [])
         self.assertGreaterEqual(popup.refresh_count, 2)
 
     def test_popup_footer_draws_on_bottom_border(self):

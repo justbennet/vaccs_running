@@ -37,7 +37,6 @@ NODE_JOBS_FIELDS = [
 ]
 NODE_JOBS_FORMAT = "%i|%u|%T|%M|%C|%b|%j"
 
-
 class SlurmError(RuntimeError):
     pass
 
@@ -140,6 +139,15 @@ class Node:
         return f"{human_mb(self.alloc_memory_mb)}/{human_mb(self.real_memory_mb)}"
 
 
+@dataclass(frozen=True)
+class UserUsage:
+    user: str
+    tasks: int
+    cpus: int
+    gpus: int
+    memory_mb: int | None = None
+
+
 class CommandRunner:
     def run(self, args: Iterable[str], timeout: float = 12.0) -> str:
         argv = list(args)
@@ -202,6 +210,11 @@ class SlurmClient:
         jobs = [parse_node_job_line(line) for line in body.splitlines() if line.strip()]
         return format_node_jobs(jobs)
 
+    def cluster_usage(self) -> str:
+        output = self.runner.run(["scontrol", "show", "job"], timeout=20.0)
+        usage = parse_scontrol_job_usage(output)
+        return format_user_usage(aggregate_user_usage(usage))
+
 
 def parse_squeue_line(line: str) -> Job:
     parts = line.rstrip("\n").split("|")
@@ -251,6 +264,145 @@ def format_node_jobs(jobs: list[dict[str, str]]) -> str:
         for job in jobs
     ]
     return "\n".join([header, divider, *rows])
+
+
+def aggregate_user_usage(tasks: Iterable[dict[str, str]]) -> list[UserUsage]:
+    usage: dict[str, dict[str, int | bool]] = {}
+    for task in tasks:
+        user = task.get("user") or "unknown"
+        row = usage.setdefault(
+            user,
+            {"tasks": 0, "cpus": 0, "gpus": 0, "memory_mb": 0, "has_memory": False},
+        )
+        row["tasks"] = int(row["tasks"]) + 1
+        row["cpus"] = int(row["cpus"]) + parse_int(task.get("cpus", ""))
+        row["gpus"] = int(row["gpus"]) + parse_gpu_count(task.get("tres", ""))
+        memory_mb = parse_memory_mb(task.get("memory", ""))
+        if memory_mb is not None:
+            row["memory_mb"] = int(row["memory_mb"]) + memory_mb
+            row["has_memory"] = True
+
+    summaries = [
+        UserUsage(
+            user=user,
+            tasks=int(row["tasks"]),
+            cpus=int(row["cpus"]),
+            gpus=int(row["gpus"]),
+            memory_mb=int(row["memory_mb"]) if row["has_memory"] else None,
+        )
+        for user, row in usage.items()
+    ]
+    return sorted(
+        summaries,
+        key=lambda row: (-row.gpus, -row.cpus, -row.tasks, row.user),
+    )
+
+
+def format_user_usage(usage: list[UserUsage]) -> str:
+    if not usage:
+        return "No running tasks found."
+
+    total_tasks = sum(row.tasks for row in usage)
+    total_cpus = sum(row.cpus for row in usage)
+    total_gpus = sum(row.gpus for row in usage)
+    show_memory = any(row.memory_mb is not None for row in usage)
+    total_memory = sum(row.memory_mb or 0 for row in usage)
+    columns = [
+        ("user", "USER"),
+        ("tasks", "TASKS"),
+        ("cpus", "CPUS"),
+        ("gpus", "GPUS"),
+    ]
+    if show_memory:
+        columns.append(("memory", "RAM_ALLOC"))
+
+    rows: list[dict[str, str]] = []
+    for row in usage:
+        values = {
+            "user": row.user,
+            "tasks": str(row.tasks),
+            "cpus": str(row.cpus),
+            "gpus": str(row.gpus),
+        }
+        if show_memory:
+            values["memory"] = (
+                human_mb(row.memory_mb) if row.memory_mb is not None else "-"
+            )
+        rows.append(values)
+
+    total = {
+        "user": "TOTAL",
+        "tasks": str(total_tasks),
+        "cpus": str(total_cpus),
+        "gpus": str(total_gpus),
+    }
+    if show_memory:
+        total["memory"] = human_mb(total_memory)
+    rows.append(total)
+
+    widths = [
+        max(len(label), *(len(row[key]) for row in rows))
+        for key, label in columns
+    ]
+    header = "  ".join(label.ljust(width) for (_, label), width in zip(columns, widths))
+    divider = "-" * len(header)
+    body = [
+        "  ".join(row[key].ljust(width) for (key, _), width in zip(columns, widths))
+        for row in rows
+    ]
+    people = "person" if len(usage) == 1 else "people"
+    tasks_word = "task" if total_tasks == 1 else "tasks"
+    title = f"{len(usage)} {people} running {total_tasks} {tasks_word}"
+    return "\n".join([title, "", header, divider, *body])
+
+
+def parse_scontrol_job_usage(output: str) -> list[dict[str, str]]:
+    usage: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("JobId="):
+            append_job_usage(usage, current)
+            current = {}
+        current.update(parse_key_values(stripped))
+
+    append_job_usage(usage, current)
+    return usage
+
+
+def append_job_usage(
+    usage: list[dict[str, str]],
+    fields: dict[str, str],
+) -> None:
+    if not fields or fields.get("JobState", "").upper() != "RUNNING":
+        return
+    tres = fields.get("AllocTRES") or fields.get("ReqTRES", "")
+    usage.append(
+        {
+            "job_id": fields.get("JobId", ""),
+            "user": parse_user_id(fields.get("UserId", "")),
+            "cpus": parse_tres_value(tres, "cpu") or fields.get("NumCPUs", ""),
+            "tres": tres,
+            "memory": parse_tres_value(tres, "mem") or fields.get("MinMemoryNode", ""),
+        }
+    )
+
+
+def parse_user_id(value: str) -> str:
+    if not value:
+        return ""
+    return value.split("(", 1)[0]
+
+
+def parse_tres_value(tres: str, key: str) -> str:
+    for part in tres.split(","):
+        name, separator, value = part.partition("=")
+        if separator and name == key:
+            return value
+    return ""
 
 
 def summarize_jobs(jobs: Iterable[Job]) -> dict[str, int]:
@@ -311,6 +463,33 @@ def parse_int(value: str) -> int:
         return int(value)
     except ValueError:
         return 0
+
+
+def parse_gpu_count(value: str) -> int:
+    return sum(
+        int(match)
+        for match in re.findall(r"(?:gres/)?gpu(?::[^,;:=()]+)*[:=](\d+)", value)
+    )
+
+
+def parse_memory_mb(value: str) -> int | None:
+    stripped = value.strip()
+    if not stripped or stripped.upper() in {"N/A", "NONE", "(NULL)"}:
+        return None
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([KMGTkmgt]?)([cnCN]?)", stripped)
+    if not match:
+        return None
+    amount = float(match.group(1))
+    unit = match.group(2).upper()
+    multiplier = {
+        "": 1,
+        "K": 1 / 1024,
+        "M": 1,
+        "G": 1024,
+        "T": 1024 * 1024,
+    }[unit]
+    memory_mb = int(amount * multiplier)
+    return memory_mb if memory_mb > 0 else None
 
 
 def parse_float(value: str) -> float:

@@ -231,6 +231,9 @@ class VaccsRunningApp:
         elif key == ord("p"):
             if self.state.view == "nodes":
                 self._show_node_jobs(stdscr)
+        elif key == ord("i"):
+            if self.state.view == "nodes":
+                self._show_node_usage(stdscr)
 
         self._clamp_selection()
         return True
@@ -364,6 +367,8 @@ class VaccsRunningApp:
             x += len(" d detail ") + 1
             self._addstr(stdscr, 3, x, " p peek ", self._pair(MUTED_PAIR))
             x += len(" p peek ") + 1
+            self._addstr(stdscr, 3, x, " i usage ", self._pair(MUTED_PAIR))
+            x += len(" i usage ") + 1
             self._addstr(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR))
         else:
             x = 1
@@ -771,6 +776,14 @@ class VaccsRunningApp:
             close_keys=(ord("p"),),
         )
 
+    def _show_node_usage(self, stdscr: curses.window) -> None:
+        self._popup(
+            stdscr,
+            "running usage by user",
+            command_text(lambda _: self.client.cluster_usage(), ""),
+            close_keys=(ord("i"),),
+        )
+
     def _popup_command(
         self,
         stdscr: curses.window,
@@ -792,6 +805,7 @@ class VaccsRunningApp:
         title: str,
         text: str | Callable[[], str],
         close_keys: tuple[int, ...] = (),
+        refresh_while_open: bool = True,
     ) -> None:
         get_text = text if callable(text) else lambda: text
         current_text = get_text()
@@ -805,7 +819,11 @@ class VaccsRunningApp:
         wrapped = wrap_lines(current_text, box_width - 4)
         while True:
             now = time.monotonic()
-            if self.refresh_seconds and now - last_refresh >= self.refresh_seconds:
+            if (
+                refresh_while_open
+                and self.refresh_seconds
+                and now - last_refresh >= self.refresh_seconds
+            ):
                 self._refresh_current()
                 self._draw(stdscr)
                 height, width = stdscr.getmaxyx()
