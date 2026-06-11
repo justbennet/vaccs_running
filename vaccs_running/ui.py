@@ -6,7 +6,16 @@ import textwrap
 import time
 from dataclasses import dataclass
 
-from .slurm import Job, Node, SlurmClient, SlurmError, summarize_jobs, summarize_nodes
+from .slurm import (
+    Job,
+    JobGroup,
+    Node,
+    SlurmClient,
+    SlurmError,
+    group_jobs,
+    summarize_jobs,
+    summarize_nodes,
+)
 
 
 STATE_COLORS = {
@@ -48,6 +57,7 @@ class AppState:
     last_refresh: float = 0.0
     gpu_nodes_only: bool = False
     free_gpu_only: bool = False
+    jobs_grouped: bool = False
 
 
 class VaccsRunningApp:
@@ -170,6 +180,9 @@ class VaccsRunningApp:
     def _visible_jobs(self) -> list[Job]:
         return self.state.jobs
 
+    def _visible_job_groups(self) -> list[JobGroup]:
+        return group_jobs(self.state.jobs)
+
     def _visible_nodes(self) -> list[Node]:
         visible = self.state.nodes
         if self.state.gpu_nodes_only:
@@ -181,6 +194,8 @@ class VaccsRunningApp:
     def _visible_count(self) -> int:
         if self.state.view == "nodes":
             return len(self._visible_nodes())
+        if self.state.jobs_grouped:
+            return len(self._visible_job_groups())
         return len(self._visible_jobs())
 
     def _handle_key(self, stdscr: curses.window, key: int) -> bool:
@@ -216,6 +231,12 @@ class VaccsRunningApp:
                 self.state.scroll = 0
                 state = "on" if self.state.gpu_nodes_only else "off"
                 self.state.message = f"GPU node filter {state}"
+            else:
+                self.state.jobs_grouped = not self.state.jobs_grouped
+                self.state.selected = 0
+                self.state.scroll = 0
+                state = "on" if self.state.jobs_grouped else "off"
+                self.state.message = f"job grouping {state}"
         elif key == ord("f"):
             if self.state.view == "nodes":
                 enabled = not self.state.free_gpu_only
@@ -278,7 +299,18 @@ class VaccsRunningApp:
         self.state.selected = max(0, min(self.state.selected, count - 1))
 
     def _selected_job(self) -> Job | None:
+        if self.state.jobs_grouped:
+            return None
         visible = self._visible_jobs()
+        if not visible:
+            return None
+        self._clamp_selection()
+        return visible[self.state.selected]
+
+    def _selected_job_group(self) -> JobGroup | None:
+        if not self.state.jobs_grouped:
+            return None
+        visible = self._visible_job_groups()
         if not visible:
             return None
         self._clamp_selection()
@@ -302,6 +334,14 @@ class VaccsRunningApp:
         if self.state.view == "nodes":
             self._draw_nodes_table(stdscr, self._visible_nodes(), height, width)
             self._draw_node_detail(stdscr, height, width)
+        elif self.state.jobs_grouped:
+            self._draw_job_groups_table(
+                stdscr,
+                self._visible_job_groups(),
+                height,
+                width,
+            )
+            self._draw_job_group_detail(stdscr, height, width)
         else:
             self._draw_jobs_table(stdscr, self._visible_jobs(), height, width)
             self._draw_job_detail(stdscr, height, width)
@@ -372,6 +412,15 @@ class VaccsRunningApp:
             self._addstr(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR))
         else:
             x = 1
+            group_text = " g group "
+            self._addstr(
+                stdscr,
+                3,
+                x,
+                group_text,
+                self._pair(ACTIVE_TAB_PAIR if self.state.jobs_grouped else MUTED_PAIR),
+            )
+            x += len(group_text) + 1
             self._addstr(stdscr, 3, x, " d detail ", self._pair(MUTED_PAIR))
             x += len(" d detail ") + 1
             self._addstr(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR))
@@ -451,6 +500,95 @@ class VaccsRunningApp:
                 text = value[:size].ljust(size)
                 if x < width:
                     self._addstr(stdscr, screen_row, x, text[: max(0, width - x - 1)], attr)
+                x += size + 1
+
+    def _draw_job_groups_table(
+        self,
+        stdscr: curses.window,
+        visible: list[JobGroup],
+        height: int,
+        width: int,
+    ) -> None:
+        table_top = 5
+        detail_height = min(8, max(4, height // 4))
+        table_height = max(4, height - detail_height - table_top)
+        title = status_title(
+            "Job Groups",
+            summarize_jobs(self.state.jobs),
+            ["RUNNING", "PENDING", "COMPLETED", "FAILED", "CANCELLED"],
+        )
+        self._draw_box(stdscr, table_top, 0, table_height, width, title)
+        header_y = table_top + 1
+        first_row = table_top + 2
+        rows = max(0, table_height - 3)
+        available_width = max(1, width - 4)
+        group_specs = responsive_job_group_specs(available_width)
+        row_values = [
+            [value_fn(group) for _, _, _, value_fn in group_specs]
+            for group in visible
+        ]
+        columns = fit_columns(
+            [
+                (label, min_width, max_width)
+                for label, min_width, max_width, _ in group_specs
+            ],
+            row_values,
+            available_width,
+        )
+        headers = [
+            (label, column_width)
+            for (label, _, _, _), column_width in zip(group_specs, columns)
+        ]
+        x = 2
+        for label, size in headers:
+            self._addstr(
+                stdscr,
+                header_y,
+                x,
+                label[:size].ljust(size),
+                self._pair(MUTED_PAIR) | curses.A_BOLD,
+            )
+            x += size + 1
+
+        if self.state.selected < self.state.scroll:
+            self.state.scroll = self.state.selected
+        if self.state.selected >= self.state.scroll + rows:
+            self.state.scroll = self.state.selected - rows + 1
+        page_label = page_status(self.state.selected, len(visible), rows)
+        if page_label:
+            footer = f" {page_label} "
+            footer_x = max(2, width - len(footer) - 2)
+            self._addstr(
+                stdscr,
+                table_top + table_height - 1,
+                footer_x,
+                footer,
+                self._pair(5) | curses.A_BOLD,
+            )
+
+        for screen_row, group in enumerate(
+            visible[self.state.scroll : self.state.scroll + rows],
+            start=first_row,
+        ):
+            index = self.state.scroll + screen_row - first_row
+            attr = self._state_attr(group.dominant_state)
+            if index == self.state.selected:
+                attr |= curses.A_REVERSE
+            cells = [
+                (value_fn(group), column_width)
+                for (_, _, _, value_fn), column_width in zip(group_specs, columns)
+            ]
+            x = 2
+            for value, size in cells:
+                text = value[:size].ljust(size)
+                if x < width:
+                    self._addstr(
+                        stdscr,
+                        screen_row,
+                        x,
+                        text[: max(0, width - x - 1)],
+                        attr,
+                    )
                 x += size + 1
 
     def _draw_nodes_table(
@@ -647,6 +785,42 @@ class VaccsRunningApp:
                 2,
                 line,
                 self._state_attr(job.state),
+            )
+
+    def _draw_job_group_detail(
+        self,
+        stdscr: curses.window,
+        height: int,
+        width: int,
+    ) -> None:
+        panel_height = min(8, max(4, height // 4))
+        top = max(4, height - panel_height)
+        group = self._selected_job_group()
+        self._draw_box(stdscr, top, 0, panel_height, width, " selected job group ")
+        if not group:
+            self._addstr(stdscr, top + 1, 2, "No job groups found.", self._pair(2))
+            return
+
+        lines = [
+            f"{group.name}  array-parent={group.array_parent}",
+            (
+                f"completed={group.completed}/{group.total}  requested={group.total} "
+                f"running={group.running}  pending={group.pending}  failed={group.failed}"
+            ),
+            (
+                f"longest-running={group.longest_running_elapsed}  "
+                f"limit={group.limit}  other={group.other}"
+            ),
+        ]
+        body_rows = max(0, min(height - 1, top + panel_height - 1) - top - 1)
+        wrapped = wrap_detail_lines(lines, max(1, width - 4))
+        for offset, line in enumerate(wrapped[:body_rows]):
+            self._addstr(
+                stdscr,
+                top + 1 + offset,
+                2,
+                line,
+                self._state_attr(group.dominant_state),
             )
 
     def _draw_node_detail(self, stdscr: curses.window, height: int, width: int) -> None:
@@ -1004,6 +1178,25 @@ def responsive_job_specs(
     return [spec for spec in specs if spec[0] != "CPUS"]
 
 
+def responsive_job_group_specs(
+    available_width: int,
+) -> list[tuple[str, int, int, Callable[[JobGroup], str]]]:
+    specs: list[tuple[str, int, int, Callable[[JobGroup], str]]] = [
+        ("JOBID", 10, 16, lambda group: group.array_parent),
+        ("JOB", 12, 28, lambda group: group.name),
+        ("DONE/REQ", 8, 10, lambda group: group.done_text),
+        ("REQ", 3, 5, lambda group: str(group.total)),
+        ("RUN", 3, 5, lambda group: str(group.running)),
+        ("PEND", 4, 5, lambda group: str(group.pending)),
+        ("FAIL", 4, 5, lambda group: str(group.failed)),
+        ("RUN_FOR", 7, 12, lambda group: group.longest_running_elapsed),
+        ("LIMIT", 8, 14, lambda group: group.limit),
+    ]
+    if minimum_table_width(label_widths(specs)) <= available_width:
+        return specs
+    return [spec for spec in specs if spec[0] != "LIMIT"]
+
+
 def responsive_node_specs(
     show_resource_bars: bool,
     cpu_count_width: int,
@@ -1036,7 +1229,8 @@ def responsive_node_specs(
 
 
 def label_widths(
-    specs: list[tuple[str, int, int, Callable[[Job], str]]],
+    specs: list[tuple[str, int, int, Callable[[Job], str]]]
+    | list[tuple[str, int, int, Callable[[JobGroup], str]]],
 ) -> list[tuple[str, int, int]]:
     return [(label, min_width, max_width) for label, min_width, max_width, _ in specs]
 

@@ -6,10 +6,12 @@ from vaccs_running.slurm import (
     aggregate_user_usage,
     format_node_jobs,
     format_user_usage,
+    group_jobs,
     parse_node_job_line,
     parse_scontrol_nodes,
     parse_scontrol_job_usage,
     parse_squeue_line,
+    parse_elapsed_seconds,
     parse_gpu_count,
     parse_memory_mb,
     parse_tres_value,
@@ -34,7 +36,20 @@ class SlurmParsingTests(unittest.TestCase):
         client.runner = fake_runner
 
         self.assertEqual(client.fetch_jobs(), [])
-        self.assertEqual(fake_runner.calls[0][0][:2], ["squeue", "--array"])
+        self.assertEqual(
+            fake_runner.calls[0][0],
+            [
+                "squeue",
+                "--array",
+                "-h",
+                "-u",
+                "dgezgin",
+                "-t",
+                "all",
+                "-o",
+                "%i|%j|%T|%P|%N|%R|%M|%l|%D|%C|%b|%V|%S",
+            ],
+        )
 
     def test_parse_squeue_line_running_job(self):
         job = parse_squeue_line(
@@ -55,6 +70,51 @@ class SlurmParsingTests(unittest.TestCase):
 
         self.assertEqual(job.location, "pending: Resources")
         self.assertEqual(summarize_jobs([job]), {"PENDING": 1})
+
+    def test_group_jobs_counts_array_progress_and_longest_running_task(self):
+        jobs = [
+            parse_squeue_line(
+                "4413548_1|ae-pert-cand|COMPLETED|gpu-preempt|h2node01|None|"
+                "1:00:00|4:00:00|1|4|N/A|2026-06-11T16:55:01|2026-06-11T16:55:02"
+            ),
+            parse_squeue_line(
+                "4413548_2|ae-pert-cand|RUNNING|gpu-preempt|h2node02|None|"
+                "2:11:04|4:00:00|1|4|N/A|2026-06-11T16:55:01|2026-06-11T16:55:02"
+            ),
+            parse_squeue_line(
+                "4413548_3|ae-pert-cand|RUNNING|gpu-preempt|h2node03|None|"
+                "45:19|4:00:00|1|4|N/A|2026-06-11T16:55:01|2026-06-11T18:20:47"
+            ),
+            parse_squeue_line(
+                "4413548_4|ae-pert-cand|PENDING|gpu-preempt||Resources|"
+                "0:00|4:00:00|1|4|N/A|2026-06-11T16:55:01|2026-06-11T18:20:47"
+            ),
+            parse_squeue_line(
+                "4413548_5|ae-pert-cand|FAILED|gpu-preempt|h2node04|None|"
+                "10:43|4:00:00|1|4|N/A|2026-06-11T16:55:01|2026-06-11T18:20:47"
+            ),
+        ]
+
+        groups = group_jobs(jobs)
+
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+        self.assertEqual(group.array_parent, "4413548")
+        self.assertEqual(group.name, "ae-pert-cand")
+        self.assertEqual(group.done_text, "1/5")
+        self.assertEqual(group.completed, 1)
+        self.assertEqual(group.running, 2)
+        self.assertEqual(group.pending, 1)
+        self.assertEqual(group.failed, 1)
+        self.assertEqual(group.longest_running_elapsed, "2:11:04")
+        self.assertEqual(group.limit, "4:00:00")
+        self.assertEqual(group.dominant_state, "RUNNING")
+
+    def test_parse_elapsed_seconds_handles_slurm_elapsed_formats(self):
+        self.assertEqual(parse_elapsed_seconds("45:19"), 2719)
+        self.assertEqual(parse_elapsed_seconds("2:11:04"), 7864)
+        self.assertEqual(parse_elapsed_seconds("1-02:20:01"), 94801)
+        self.assertEqual(parse_elapsed_seconds("N/A"), -1)
 
     def test_parse_scontrol_node_load(self):
         nodes = parse_scontrol_nodes(

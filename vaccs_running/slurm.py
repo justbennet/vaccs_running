@@ -75,6 +75,36 @@ class Job:
 
 
 @dataclass(frozen=True)
+class JobGroup:
+    array_parent: str
+    name: str
+    total: int
+    completed: int
+    running: int
+    pending: int
+    failed: int
+    other: int
+    longest_running_elapsed: str
+    limit: str
+
+    @property
+    def done_text(self) -> str:
+        return f"{self.completed}/{self.total}"
+
+    @property
+    def dominant_state(self) -> str:
+        if self.running:
+            return "RUNNING"
+        if self.pending:
+            return "PENDING"
+        if self.failed:
+            return "FAILED"
+        if self.completed == self.total and self.total:
+            return "COMPLETED"
+        return "UNKNOWN"
+
+
+@dataclass(frozen=True)
 class Node:
     name: str
     state: str
@@ -179,7 +209,17 @@ class SlurmClient:
 
     def fetch_jobs(self) -> list[Job]:
         output = self.runner.run(
-            ["squeue", "--array", "-h", "-u", self.user, "-o", SQUEUE_FORMAT],
+            [
+                "squeue",
+                "--array",
+                "-h",
+                "-u",
+                self.user,
+                "-t",
+                "all",
+                "-o",
+                SQUEUE_FORMAT,
+            ],
             timeout=15.0,
         )
         jobs: list[Job] = []
@@ -264,6 +304,60 @@ def format_node_jobs(jobs: list[dict[str, str]]) -> str:
         for job in jobs
     ]
     return "\n".join([header, divider, *rows])
+
+
+def group_jobs(jobs: Iterable[Job]) -> list[JobGroup]:
+    groups: dict[tuple[str, str], dict[str, object]] = {}
+    for job in jobs:
+        key = (job.array_parent, job.name)
+        group = groups.setdefault(
+            key,
+            {
+                "array_parent": job.array_parent,
+                "name": job.name,
+                "total": 0,
+                "completed": 0,
+                "running": 0,
+                "pending": 0,
+                "failed": 0,
+                "other": 0,
+                "longest_running_elapsed": "-",
+                "longest_running_seconds": -1,
+                "limit": job.limit or "-",
+            },
+        )
+        group["total"] = int(group["total"]) + 1
+        state = job.state.upper()
+        if state == "COMPLETED":
+            group["completed"] = int(group["completed"]) + 1
+        elif state == "RUNNING":
+            group["running"] = int(group["running"]) + 1
+            seconds = parse_elapsed_seconds(job.elapsed)
+            if seconds > int(group["longest_running_seconds"]):
+                group["longest_running_seconds"] = seconds
+                group["longest_running_elapsed"] = job.elapsed or "-"
+        elif state == "PENDING":
+            group["pending"] = int(group["pending"]) + 1
+        elif state in {"FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY"}:
+            group["failed"] = int(group["failed"]) + 1
+        else:
+            group["other"] = int(group["other"]) + 1
+
+    return [
+        JobGroup(
+            array_parent=str(group["array_parent"]),
+            name=str(group["name"]),
+            total=int(group["total"]),
+            completed=int(group["completed"]),
+            running=int(group["running"]),
+            pending=int(group["pending"]),
+            failed=int(group["failed"]),
+            other=int(group["other"]),
+            longest_running_elapsed=str(group["longest_running_elapsed"]),
+            limit=str(group["limit"]),
+        )
+        for group in groups.values()
+    ]
 
 
 def aggregate_user_usage(tasks: Iterable[dict[str, str]]) -> list[UserUsage]:
@@ -490,6 +584,31 @@ def parse_memory_mb(value: str) -> int | None:
     }[unit]
     memory_mb = int(amount * multiplier)
     return memory_mb if memory_mb > 0 else None
+
+
+def parse_elapsed_seconds(value: str) -> int:
+    stripped = value.strip()
+    if not stripped or stripped.upper() in {"N/A", "UNLIMITED"}:
+        return -1
+    days = 0
+    time_part = stripped
+    if "-" in stripped:
+        day_part, time_part = stripped.split("-", 1)
+        days = parse_int(day_part)
+    pieces = time_part.split(":")
+    if len(pieces) == 2:
+        hours = 0
+        minutes, seconds = pieces
+    elif len(pieces) == 3:
+        hours, minutes, seconds = pieces
+    else:
+        return -1
+    return (
+        days * 24 * 60 * 60
+        + parse_int(hours) * 60 * 60
+        + parse_int(minutes) * 60
+        + parse_int(seconds)
+    )
 
 
 def parse_float(value: str) -> float:

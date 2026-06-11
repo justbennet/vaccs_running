@@ -104,16 +104,16 @@ def make_node(name, gres, alloc_tres="", state="IDLE"):
     )
 
 
-def make_job(job_id, state="RUNNING"):
+def make_job(job_id, state="RUNNING", name="job", elapsed="0:01", limit="1:00:00"):
     return Job(
         job_id=job_id,
-        name="job",
+        name=name,
         state=state,
         partition="nvgpu",
         nodes="h2node01",
         reason="",
-        elapsed="0:01",
-        limit="1:00:00",
+        elapsed=elapsed,
+        limit=limit,
         node_count="1",
         cpus="1",
         gres="",
@@ -141,6 +141,15 @@ class NodeFilterTests(unittest.TestCase):
         written = " ".join(write[2] for write in screen.writes)
         self.assertNotIn("refresh", written)
         self.assertNotIn("0.25s", written)
+
+    def test_jobs_header_shows_group_toggle(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        screen = FakeScreen(height=12, width=100)
+
+        app._draw_header(screen, 100)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn(" g group ", written)
 
     def test_terminal_too_small_uses_minimum_size(self):
         self.assertTrue(terminal_too_small(69, 32))
@@ -229,6 +238,54 @@ class NodeFilterTests(unittest.TestCase):
         self.assertNotIn("LIMIT", written)
         self.assertNotIn("CPUS", written)
 
+    def test_grouped_jobs_table_shows_progress_counts_and_runtime(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.jobs_grouped = True
+        app.state.jobs = [
+            make_job("4413548_1", "COMPLETED", name="ae-pert-cand"),
+            make_job(
+                "4413548_2",
+                "RUNNING",
+                name="ae-pert-cand",
+                elapsed="2:11:04",
+                limit="4:00:00",
+            ),
+            make_job("4413548_3", "PENDING", name="ae-pert-cand"),
+            make_job("4413548_4", "FAILED", name="ae-pert-cand"),
+        ]
+        screen = FakeScreen(height=40, width=140)
+
+        app._draw_job_groups_table(
+            screen,
+            app._visible_job_groups(),
+            screen.height,
+            screen.width,
+        )
+
+        written = " ".join(write[2].strip() for write in screen.writes)
+        self.assertIn("DONE/REQ", written)
+        self.assertIn("RUN_FOR", written)
+        self.assertIn("4413548", written)
+        self.assertIn("ae-pert-cand", written)
+        self.assertIn("1/4", written)
+        self.assertIn("2:11:04", written)
+
+    def test_grouped_job_detail_shows_requested_total(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.jobs_grouped = True
+        app.state.jobs = [
+            make_job("4413548_1", "COMPLETED", name="ae-pert-cand"),
+            make_job("4413548_2", "RUNNING", name="ae-pert-cand"),
+        ]
+        screen = FakeScreen(height=40, width=120)
+
+        app._draw_job_group_detail(screen, screen.height, screen.width)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn("selected job group", written)
+        self.assertIn("completed=1/2", written)
+        self.assertIn("requested=2", written)
+
     def test_nodes_table_title_includes_overall_node_status(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
         app.state.nodes = [
@@ -280,6 +337,24 @@ class NodeFilterTests(unittest.TestCase):
 
         self.assertTrue(app._handle_key(None, ord("j")))
         self.assertEqual(app.state.view, "jobs")
+
+    def test_g_toggles_job_grouping_in_jobs_view(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.view = "jobs"
+        app.state.selected = 5
+        app.state.scroll = 3
+
+        self.assertTrue(app._handle_key(None, ord("g")))
+
+        self.assertTrue(app.state.jobs_grouped)
+        self.assertEqual(app.state.selected, 0)
+        self.assertEqual(app.state.scroll, 0)
+        self.assertEqual(app.state.message, "job grouping on")
+
+        self.assertTrue(app._handle_key(None, ord("g")))
+
+        self.assertFalse(app.state.jobs_grouped)
+        self.assertEqual(app.state.message, "job grouping off")
 
     def test_g_toggles_gpu_node_filter(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
