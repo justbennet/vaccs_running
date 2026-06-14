@@ -6,6 +6,7 @@ from vaccs_running.slurm import (
     aggregate_user_usage,
     format_node_jobs,
     format_user_usage,
+    free_gpu_count,
     group_jobs,
     parse_node_job_line,
     parse_scontrol_nodes,
@@ -22,10 +23,17 @@ from vaccs_running.slurm import (
 class FakeRunner:
     def __init__(self, output=""):
         self.calls = []
-        self.output = output
+        if isinstance(output, (list, tuple)):
+            self.outputs = list(output)
+            self.output = ""
+        else:
+            self.outputs = None
+            self.output = output
 
     def run(self, args, timeout=12.0):
         self.calls.append((args, timeout))
+        if self.outputs is not None:
+            return self.outputs.pop(0) if self.outputs else ""
         return self.output
 
 
@@ -137,8 +145,38 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertEqual(node.free_cpus, 179)
         self.assertEqual(node.cpu_load, 4.74)
         self.assertTrue(node.has_gpus)
+        self.assertFalse(node.is_debug_gpu_node)
         self.assertEqual(node.gpu_text, "4/4")
         self.assertEqual(node.gpu_free, 0)
+
+    def test_free_gpu_count_excludes_debug_gpu_partitions(self):
+        nodes = parse_scontrol_nodes(
+            """NodeName=gpunode001 Arch=x86_64 CoresPerSocket=64
+   CPUAlloc=0 CPUTot=128 CPULoad=0.18
+   Gres=gpu:a100:2
+   RealMemory=1000000 AllocMem=0 FreeMem=966060
+   State=IDLE ThreadsPerCore=1
+   Partitions=gpu-debug
+   AllocTRES=
+NodeName=h2node01 Arch=x86_64 CoresPerSocket=96
+   CPUAlloc=13 CPUTot=192 CPULoad=4.74
+   Gres=gpu:h200:4
+   RealMemory=1000000 AllocMem=198656 FreeMem=942714
+   State=MIXED ThreadsPerCore=1
+   Partitions=nvgpu
+   AllocTRES=cpu=13,mem=194G,gres/gpu=1
+NodeName=cpu01 Arch=x86_64 CoresPerSocket=32
+   CPUAlloc=0 CPUTot=64 CPULoad=0.00
+   Gres=(null)
+   RealMemory=100000 AllocMem=0 FreeMem=90000
+   State=IDLE ThreadsPerCore=1
+   Partitions=general
+   AllocTRES=
+"""
+        )
+
+        self.assertTrue(nodes[0].is_debug_gpu_node)
+        self.assertEqual(free_gpu_count(nodes), 3)
 
     def test_node_jobs_queries_selected_node(self):
         client = SlurmClient(user="dgezgin")
@@ -167,7 +205,8 @@ class SlurmParsingTests(unittest.TestCase):
     def test_cluster_usage_queries_running_tasks_across_all_nodes(self):
         client = SlurmClient(user="dgezgin")
         fake_runner = FakeRunner(
-            """JobId=4341591 ArrayJobId=4341591 ArrayTaskId=1 JobName=train
+            [
+                """JobId=4341591 ArrayJobId=4341591 ArrayTaskId=1 JobName=train
    UserId=dgezgin(512550) GroupId=pi-ncheney(170095)
    JobState=RUNNING Reason=None Dependency=(null)
    NumCPUs=4 ReqTRES=cpu=4,mem=16G,node=1,billing=4,gres/gpu=1
@@ -177,7 +216,23 @@ JobId=4341592 ArrayJobId=4341592 ArrayTaskId=7 JobName=train
    JobState=RUNNING Reason=None Dependency=(null)
    NumCPUs=8 ReqTRES=cpu=8,mem=32G,node=1,billing=8
    AllocTRES=cpu=8,mem=32G,node=1,billing=8
-"""
+""",
+                """NodeName=gpunode001 Arch=x86_64 CoresPerSocket=64
+   CPUAlloc=0 CPUTot=128 CPULoad=0.18
+   Gres=gpu:a100:2
+   RealMemory=1000000 AllocMem=0 FreeMem=966060
+   State=IDLE ThreadsPerCore=1
+   Partitions=gpu-debug
+   AllocTRES=
+NodeName=h2node01 Arch=x86_64 CoresPerSocket=96
+   CPUAlloc=13 CPUTot=192 CPULoad=4.74
+   Gres=gpu:h200:4
+   RealMemory=1000000 AllocMem=198656 FreeMem=942714
+   State=MIXED ThreadsPerCore=1
+   Partitions=nvgpu
+   AllocTRES=cpu=13,mem=194G,gres/gpu=1
+""",
+            ]
         )
         client.runner = fake_runner
 
@@ -187,10 +242,15 @@ JobId=4341592 ArrayJobId=4341592 ArrayTaskId=7 JobName=train
             fake_runner.calls[0][0],
             ["scontrol", "show", "job"],
         )
+        self.assertEqual(
+            fake_runner.calls[1][0],
+            ["scontrol", "show", "node"],
+        )
         self.assertIn("2 people running 2 tasks", output)
         self.assertIn("dgezgin", output)
         self.assertIn("other", output)
         self.assertIn("TOTAL", output)
+        self.assertRegex(output, r"(?m)^FREE\s+-\s+-\s+3")
 
     def test_parse_node_job_line_strips_fields(self):
         job = parse_node_job_line(
@@ -296,6 +356,31 @@ JobId=4341592 ArrayJobId=4341592 ArrayTaskId=7 JobName=train
         self.assertIn("CPUS", text)
         self.assertIn("GPUS", text)
         self.assertNotIn("RAM", text)
+
+    def test_format_user_usage_adds_free_row_after_total(self):
+        usage = aggregate_user_usage(
+            [
+                {
+                    "job_id": "1",
+                    "user": "alice",
+                    "cpus": "4",
+                    "tres": "cpu=4,gres/gpu=1",
+                    "memory": "N/A",
+                }
+            ]
+        )
+
+        text = format_user_usage(usage, free_gpus=7)
+        lines = text.splitlines()
+        total_index = next(
+            index for index, line in enumerate(lines) if line.startswith("TOTAL")
+        )
+        free_index = next(
+            index for index, line in enumerate(lines) if line.startswith("FREE")
+        )
+
+        self.assertEqual(free_index, total_index + 1)
+        self.assertRegex(lines[free_index].rstrip(), r"^FREE\s+-\s+-\s+7$")
 
     def test_parse_scontrol_job_usage_counts_running_alloc_tres(self):
         usage = parse_scontrol_job_usage(

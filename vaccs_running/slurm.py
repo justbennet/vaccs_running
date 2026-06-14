@@ -148,6 +148,14 @@ class Node:
         return self.gpu_total > 0
 
     @property
+    def is_debug_gpu_node(self) -> bool:
+        return self.has_gpus and any(
+            "debug" in partition.lower()
+            for partition in re.split(r"[,\s]+", self.partitions.strip())
+            if partition
+        )
+
+    @property
     def gpu_alloc(self) -> int:
         match = re.search(r"(?:^|,)gres/gpu=(\d+)", self.alloc_tres)
         if not match:
@@ -251,9 +259,11 @@ class SlurmClient:
         return format_node_jobs(jobs)
 
     def cluster_usage(self) -> str:
-        output = self.runner.run(["scontrol", "show", "job"], timeout=20.0)
-        usage = parse_scontrol_job_usage(output)
-        return format_user_usage(aggregate_user_usage(usage))
+        job_output = self.runner.run(["scontrol", "show", "job"], timeout=20.0)
+        node_output = self.runner.run(["scontrol", "show", "node"], timeout=20.0)
+        usage = parse_scontrol_job_usage(job_output)
+        free_gpus = free_gpu_count(parse_scontrol_nodes(node_output))
+        return format_user_usage(aggregate_user_usage(usage), free_gpus=free_gpus)
 
 
 def parse_squeue_line(line: str) -> Job:
@@ -392,8 +402,16 @@ def aggregate_user_usage(tasks: Iterable[dict[str, str]]) -> list[UserUsage]:
     )
 
 
-def format_user_usage(usage: list[UserUsage]) -> str:
-    if not usage:
+def free_gpu_count(nodes: Iterable[Node]) -> int:
+    return sum(
+        node.gpu_free
+        for node in nodes
+        if node.has_gpus and not node.is_debug_gpu_node
+    )
+
+
+def format_user_usage(usage: list[UserUsage], free_gpus: int | None = None) -> str:
+    if not usage and free_gpus is None:
         return "No running tasks found."
 
     total_tasks = sum(row.tasks for row in usage)
@@ -433,6 +451,16 @@ def format_user_usage(usage: list[UserUsage]) -> str:
     if show_memory:
         total["memory"] = human_mb(total_memory)
     rows.append(total)
+    if free_gpus is not None:
+        free = {
+            "user": "FREE",
+            "tasks": "-",
+            "cpus": "-",
+            "gpus": str(free_gpus),
+        }
+        if show_memory:
+            free["memory"] = "-"
+        rows.append(free)
 
     widths = [
         max(len(label), *(len(row[key]) for row in rows))
