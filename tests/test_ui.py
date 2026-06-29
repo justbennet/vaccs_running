@@ -3,6 +3,7 @@ import unittest
 
 from vaccs_running.slurm import Job, JobRecord, Node
 from vaccs_running.ui import (
+    HISTORY_REFRESH_SECONDS,
     VaccsRunningApp,
     command_text,
     page_status,
@@ -178,6 +179,16 @@ class NodeFilterTests(unittest.TestCase):
         written = " ".join(write[2] for write in screen.writes)
         self.assertNotIn("refresh", written)
         self.assertNotIn("0.25s", written)
+
+    def test_history_view_uses_ten_second_refresh_interval(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0.25)
+        self.assertEqual(app._active_refresh_seconds(), 0.25)
+
+        app.state.view = "history"
+        self.assertEqual(app._active_refresh_seconds(), HISTORY_REFRESH_SECONDS)
+
+        disabled = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="history")
+        self.assertEqual(disabled._active_refresh_seconds(), 0)
 
     def test_jobs_header_shows_group_toggle(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)

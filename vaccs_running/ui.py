@@ -51,6 +51,7 @@ MUTED_PAIR = 13
 SURFACE_PAIR = 14
 MIN_TERMINAL_WIDTH = 70
 MIN_TERMINAL_HEIGHT = 16
+HISTORY_REFRESH_SECONDS = 10.0
 HISTORY_FILTER_OPTIONS = [
     ("1h", "last 1 hour"),
     ("3h", "last 3 hours"),
@@ -99,6 +100,11 @@ class VaccsRunningApp:
     def run(self) -> None:
         curses.wrapper(self._main)
 
+    def _active_refresh_seconds(self) -> float:
+        if self.state.view == "history" and self.refresh_seconds:
+            return HISTORY_REFRESH_SECONDS
+        return self.refresh_seconds
+
     def _main(self, stdscr: curses.window) -> None:
         safe_curs_set(0)
         stdscr.nodelay(True)
@@ -113,9 +119,10 @@ class VaccsRunningApp:
                 return
 
             now = time.monotonic()
+            refresh_seconds = self._active_refresh_seconds()
             if (
-                self.refresh_seconds
-                and now - self.state.last_refresh >= self.refresh_seconds
+                refresh_seconds
+                and now - self.state.last_refresh >= refresh_seconds
             ):
                 self._refresh_current()
 

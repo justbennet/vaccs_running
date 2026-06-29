@@ -6,6 +6,13 @@ A colorful terminal UI for checking your jobs on the Vermont Advanced Computing 
 
 ## Quick Start
 
+Clone the repository:
+
+```bash
+git clone https://github.com/deringezgin/vaccs_running.git
+cd vaccs_running
+```
+
 From this directory:
 
 ```bash
@@ -24,6 +31,7 @@ that:
 If you want `vaccs-running` on your path:
 
 ```bash
+cd vaccs_running
 python3 -m pip install --user .
 vaccs-running
 ```
