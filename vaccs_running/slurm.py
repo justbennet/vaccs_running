@@ -9,6 +9,14 @@ import subprocess
 from typing import Iterable
 
 
+HISTORY_WINDOWS = {
+    "1h": "now-1hours",
+    "3h": "now-3hours",
+    "24h": "now-24hours",
+    "3d": "now-3days",
+    "7d": "now-7days",
+}
+
 SQUEUE_FIELDS = [
     "job_id",
     "name",
@@ -26,6 +34,27 @@ SQUEUE_FIELDS = [
 ]
 
 SQUEUE_FORMAT = "%i|%j|%T|%P|%N|%R|%M|%l|%D|%C|%b|%V|%S"
+SACCT_FIELDS = [
+    "job_id",
+    "raw_job_id",
+    "name",
+    "state",
+    "partition",
+    "nodes",
+    "elapsed",
+    "limit",
+    "node_count",
+    "cpus",
+    "tres",
+    "submit_time",
+    "start_time",
+    "end_time",
+    "exit_code",
+]
+SACCT_FORMAT = (
+    "JobID,JobIDRaw,JobName,State,Partition,NodeList,Elapsed,Timelimit,"
+    "NNodes,NCPUS,ReqTRES,Submit,Start,End,ExitCode"
+)
 NODE_JOBS_FIELDS = [
     "job_id",
     "user",
@@ -86,6 +115,107 @@ class JobGroup:
     other: int
     longest_running_elapsed: str
     limit: str
+
+    @property
+    def done_text(self) -> str:
+        return f"{self.completed}/{self.total}"
+
+    @property
+    def dominant_state(self) -> str:
+        if self.running:
+            return "RUNNING"
+        if self.pending:
+            return "PENDING"
+        if self.failed:
+            return "FAILED"
+        if self.completed == self.total and self.total:
+            return "COMPLETED"
+        return "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class JobRecord:
+    job_id: str
+    raw_job_id: str
+    name: str
+    state: str
+    partition: str
+    nodes: str
+    elapsed: str
+    limit: str
+    node_count: str
+    cpus: str
+    tres: str
+    submit_time: str
+    start_time: str
+    end_time: str
+    exit_code: str
+    reason: str = ""
+    source: str = "sacct"
+
+    @property
+    def array_parent(self) -> str:
+        return self.job_id.split("_", 1)[0]
+
+    @property
+    def base_state(self) -> str:
+        return state_base(self.state)
+
+    @property
+    def is_active(self) -> bool:
+        return self.base_state in {"RUNNING", "PENDING"}
+
+    @property
+    def is_running(self) -> bool:
+        return self.base_state == "RUNNING"
+
+    @property
+    def is_pending(self) -> bool:
+        return self.base_state == "PENDING"
+
+    @property
+    def is_failed(self) -> bool:
+        return self.base_state in FAILED_STATES
+
+    @property
+    def end_text(self) -> str:
+        if self.end_time and self.end_time not in {"Unknown", "None", "N/A"}:
+            return self.end_time
+        if self.is_running:
+            return "running"
+        if self.is_pending:
+            return "pending"
+        return "-"
+
+    @property
+    def location(self) -> str:
+        if self.nodes and self.nodes not in {"(null)", "N/A", "None", "Unknown"}:
+            return self.nodes
+        if self.reason and self.reason not in {"None", "N/A", "(null)"}:
+            return f"pending: {self.reason}"
+        return "-"
+
+    @property
+    def gpu_count(self) -> int:
+        return parse_gpu_count(self.tres)
+
+
+@dataclass(frozen=True)
+class JobRecordGroup:
+    array_parent: str
+    name: str
+    total: int
+    completed: int
+    running: int
+    pending: int
+    failed: int
+    other: int
+    longest_running_elapsed: str
+    limit: str
+    submit_time: str
+    end_time: str
+    cpus: int
+    gpus: int
 
     @property
     def done_text(self) -> str:
@@ -237,6 +367,50 @@ class SlurmClient:
             jobs.append(parse_squeue_line(line))
         return jobs
 
+    def fetch_active_job_records(self) -> tuple[list[Job], list[JobRecord]]:
+        jobs = self.fetch_jobs()
+        if not active_job_keys(jobs):
+            return jobs, []
+        return (
+            jobs,
+            records_for_active_jobs(
+                jobs,
+                self._fetch_sacct_records(active_jobs_start(jobs)),
+            ),
+        )
+
+    def fetch_job_history(self, window: str) -> list[JobRecord]:
+        jobs = self.fetch_jobs()
+        live_records = [record_from_job(job) for job in jobs]
+        records_by_id = {
+            record.job_id: record
+            for record in self._fetch_sacct_records(history_start(window))
+            if record.job_id
+        }
+        for record in live_records:
+            if record.is_active or record.job_id not in records_by_id:
+                records_by_id[record.job_id] = record
+        return sorted(records_by_id.values(), key=job_record_sort_key)
+
+    def _fetch_sacct_records(self, start: str) -> list[JobRecord]:
+        output = self.runner.run(
+            [
+                "sacct",
+                "-n",
+                "-P",
+                "-X",
+                "--array",
+                "-u",
+                self.user,
+                "-S",
+                start,
+                "-o",
+                SACCT_FORMAT,
+            ],
+            timeout=25.0,
+        )
+        return parse_sacct_records(output)
+
     def fetch_nodes(self) -> list[Node]:
         output = self.runner.run(["scontrol", "show", "node"], timeout=20.0)
         return parse_scontrol_nodes(output)
@@ -277,6 +451,68 @@ def parse_squeue_line(line: str) -> Job:
 
     values = {field: value.strip() for field, value in zip(SQUEUE_FIELDS, parts)}
     return Job(**values)
+
+
+def parse_sacct_records(output: str) -> list[JobRecord]:
+    records: list[JobRecord] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        records.append(parse_sacct_line(line))
+    return records
+
+
+def parse_sacct_line(line: str) -> JobRecord:
+    parts = line.rstrip("\n").split("|")
+    if len(parts) < len(SACCT_FIELDS):
+        parts.extend([""] * (len(SACCT_FIELDS) - len(parts)))
+    elif len(parts) > len(SACCT_FIELDS):
+        head = parts[: len(SACCT_FIELDS) - 1]
+        tail = "|".join(parts[len(SACCT_FIELDS) - 1 :])
+        parts = [*head, tail]
+
+    values = {field: value.strip() for field, value in zip(SACCT_FIELDS, parts)}
+    return JobRecord(**values)
+
+
+def record_from_job(job: Job) -> JobRecord:
+    return JobRecord(
+        job_id=job.job_id,
+        raw_job_id=job.job_id,
+        name=job.name,
+        state=job.state,
+        partition=job.partition,
+        nodes=job.nodes,
+        elapsed=job.elapsed,
+        limit=job.limit,
+        node_count=job.node_count,
+        cpus=job.cpus,
+        tres=job.gres,
+        submit_time=job.submit_time,
+        start_time=job.start_time,
+        end_time="",
+        exit_code="",
+        reason=job.reason,
+        source="squeue",
+    )
+
+
+def job_from_record(record: JobRecord) -> Job:
+    return Job(
+        job_id=record.job_id,
+        name=record.name,
+        state=record.state,
+        partition=record.partition,
+        nodes=record.nodes,
+        reason=record.reason,
+        elapsed=record.elapsed,
+        limit=record.limit,
+        node_count=record.node_count,
+        cpus=record.cpus,
+        gres=record.tres,
+        submit_time=record.submit_time,
+        start_time=record.start_time,
+    )
 
 
 def parse_node_job_line(line: str) -> dict[str, str]:
@@ -368,6 +604,153 @@ def group_jobs(jobs: Iterable[Job]) -> list[JobGroup]:
         )
         for group in groups.values()
     ]
+
+
+FAILED_STATES = {
+    "BOOT_FAIL",
+    "CANCELLED",
+    "DEADLINE",
+    "FAILED",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "PREEMPTED",
+    "TIMEOUT",
+}
+
+
+def state_base(state: str) -> str:
+    return state.upper().split(maxsplit=1)[0] or "UNKNOWN"
+
+
+def active_job_keys(jobs: Iterable[Job]) -> set[tuple[str, str]]:
+    return {
+        job_key(job)
+        for job in jobs
+        if state_base(job.state) in {"RUNNING", "PENDING"}
+    }
+
+
+def job_key(job: Job) -> tuple[str, str]:
+    return (job.array_parent, job.name)
+
+
+def job_record_key(record: JobRecord) -> tuple[str, str]:
+    return (record.array_parent, record.name)
+
+
+def active_jobs_start(jobs: Iterable[Job]) -> str:
+    submit_times = [
+        job.submit_time
+        for job in jobs
+        if state_base(job.state) in {"RUNNING", "PENDING"}
+        and is_slurm_timestamp(job.submit_time)
+    ]
+    if not submit_times:
+        return HISTORY_WINDOWS["3d"]
+    return min(submit_times)
+
+
+def is_slurm_timestamp(value: str) -> bool:
+    if not value or value in {"N/A", "None", "Unknown", "(null)"}:
+        return False
+    return bool(re.search(r"\d", value))
+
+
+def records_for_active_jobs(
+    jobs: Iterable[Job],
+    accounting_records: Iterable[JobRecord],
+) -> list[JobRecord]:
+    job_list = list(jobs)
+    active_keys = active_job_keys(job_list)
+    if not active_keys:
+        return []
+
+    records_by_id = {
+        record.job_id: record
+        for record in accounting_records
+        if record.job_id and job_record_key(record) in active_keys
+    }
+    for job in job_list:
+        record = record_from_job(job)
+        if job_record_key(record) not in active_keys:
+            continue
+        if record.is_active or record.job_id not in records_by_id:
+            records_by_id[record.job_id] = record
+    return sorted(records_by_id.values(), key=job_record_sort_key)
+
+
+def group_job_records(records: Iterable[JobRecord]) -> list[JobRecordGroup]:
+    groups: dict[tuple[str, str], dict[str, object]] = {}
+    for record in records:
+        key = (record.array_parent, record.name)
+        group = groups.setdefault(
+            key,
+            {
+                "array_parent": record.array_parent,
+                "name": record.name,
+                "total": 0,
+                "completed": 0,
+                "running": 0,
+                "pending": 0,
+                "failed": 0,
+                "other": 0,
+                "longest_running_elapsed": "-",
+                "longest_running_seconds": -1,
+                "limit": record.limit or "-",
+                "submit_time": record.submit_time,
+                "end_time": record.end_text,
+                "cpus": 0,
+                "gpus": 0,
+            },
+        )
+        group["total"] = int(group["total"]) + 1
+        group["cpus"] = int(group["cpus"]) + parse_int(record.cpus)
+        group["gpus"] = int(group["gpus"]) + record.gpu_count
+        if record.submit_time and (
+            not group["submit_time"] or record.submit_time < str(group["submit_time"])
+        ):
+            group["submit_time"] = record.submit_time
+        if record.end_text not in {"-", "running", "pending"} and (
+            not group["end_time"] or record.end_text > str(group["end_time"])
+        ):
+            group["end_time"] = record.end_text
+
+        state = record.base_state
+        if state == "COMPLETED":
+            group["completed"] = int(group["completed"]) + 1
+        elif state == "RUNNING":
+            group["running"] = int(group["running"]) + 1
+            seconds = parse_elapsed_seconds(record.elapsed)
+            if seconds > int(group["longest_running_seconds"]):
+                group["longest_running_seconds"] = seconds
+                group["longest_running_elapsed"] = record.elapsed or "-"
+        elif state == "PENDING":
+            group["pending"] = int(group["pending"]) + 1
+        elif state in FAILED_STATES:
+            group["failed"] = int(group["failed"]) + 1
+        else:
+            group["other"] = int(group["other"]) + 1
+
+    summaries = [
+        JobRecordGroup(
+            array_parent=str(group["array_parent"]),
+            name=str(group["name"]),
+            total=int(group["total"]),
+            completed=int(group["completed"]),
+            running=int(group["running"]),
+            pending=int(group["pending"]),
+            failed=int(group["failed"]),
+            other=int(group["other"]),
+            longest_running_elapsed=str(group["longest_running_elapsed"]),
+            limit=str(group["limit"]),
+            submit_time=str(group["submit_time"]),
+            end_time=str(group["end_time"]),
+            cpus=int(group["cpus"]),
+            gpus=int(group["gpus"]),
+        )
+        for group in groups.values()
+    ]
+    return sorted(summaries, key=job_record_group_sort_key)
 
 
 def aggregate_user_usage(tasks: Iterable[dict[str, str]]) -> list[UserUsage]:
@@ -527,6 +910,18 @@ def parse_tres_value(tres: str, key: str) -> str:
     return ""
 
 
+def history_start(window: str) -> str:
+    return HISTORY_WINDOWS.get(window, HISTORY_WINDOWS["24h"])
+
+
+def summarize_job_records(records: Iterable[JobRecord]) -> dict[str, int]:
+    summary: dict[str, int] = {}
+    for record in records:
+        key = record.base_state
+        summary[key] = summary.get(key, 0) + 1
+    return summary
+
+
 def summarize_jobs(jobs: Iterable[Job]) -> dict[str, int]:
     summary: dict[str, int] = {}
     for job in jobs:
@@ -660,3 +1055,33 @@ def summarize_nodes(nodes: Iterable[Node]) -> dict[str, int]:
         key = node.base_state
         summary[key] = summary.get(key, 0) + 1
     return summary
+
+
+def job_record_sort_key(record: JobRecord) -> tuple[int, str, str]:
+    state_rank = {
+        "RUNNING": 0,
+        "PENDING": 1,
+        "COMPLETED": 2,
+    }.get(record.base_state, 3 if record.is_failed else 4)
+    timestamp = record.start_time
+    if record.base_state == "PENDING":
+        timestamp = record.submit_time
+    elif record.end_text not in {"-", "running", "pending"}:
+        timestamp = record.end_text
+    return (state_rank, reverse_lex(timestamp), record.job_id)
+
+
+def job_record_group_sort_key(group: JobRecordGroup) -> tuple[int, str, str]:
+    state_rank = {
+        "RUNNING": 0,
+        "PENDING": 1,
+        "COMPLETED": 2,
+    }.get(group.dominant_state, 3 if group.failed else 4)
+    timestamp = group.submit_time
+    if group.end_time not in {"", "-", "running", "pending"}:
+        timestamp = group.end_time
+    return (state_rank, reverse_lex(timestamp), group.array_parent)
+
+
+def reverse_lex(value: str) -> str:
+    return "".join(chr(255 - ord(char)) for char in value)

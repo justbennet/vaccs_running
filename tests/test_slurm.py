@@ -1,13 +1,17 @@
 import unittest
 
 from vaccs_running.slurm import (
+    SACCT_FORMAT,
     NODE_JOBS_FORMAT,
     SlurmClient,
     aggregate_user_usage,
     format_node_jobs,
     format_user_usage,
     free_gpu_count,
+    group_job_records,
     group_jobs,
+    history_start,
+    parse_sacct_line,
     parse_node_job_line,
     parse_scontrol_nodes,
     parse_scontrol_job_usage,
@@ -59,6 +63,122 @@ class SlurmParsingTests(unittest.TestCase):
             ],
         )
 
+    def test_fetch_job_history_merges_sacct_with_current_squeue_rows(self):
+        client = SlurmClient(user="dgezgin")
+        fake_runner = FakeRunner(
+            [
+                (
+                    "4492653_1|direct-xcon-nsga2|COMPLETED|nvgpu|h2node03|"
+                    "h2node03|45:07|2-00:00:00|1|4|N/A|"
+                    "2026-06-28T08:37:36|2026-06-28T08:41:26\n"
+                    "4492653_42|direct-xcon-nsga2|PENDING|nvgpu||"
+                    "(Resources)|0:00|2-00:00:00|1|4|N/A|"
+                    "2026-06-28T08:37:36|2026-06-28T16:53:08\n"
+                ),
+                (
+                    "4492653_1|4492655|direct-xcon-nsga2|COMPLETED|nvgpu|"
+                    "h2node03|00:45:07|2-00:00:00|1|4|"
+                    "billing=4,cpu=4,gres/gpu=1,mem=96G,node=1|"
+                    "2026-06-28T08:37:36|2026-06-28T08:41:26|"
+                    "2026-06-28T09:26:33|0:0\n"
+                ),
+            ]
+        )
+        client.runner = fake_runner
+
+        records = client.fetch_job_history("3h")
+
+        self.assertEqual(
+            fake_runner.calls[1][0],
+            [
+                "sacct",
+                "-n",
+                "-P",
+                "-X",
+                "--array",
+                "-u",
+                "dgezgin",
+                "-S",
+                "now-3hours",
+                "-o",
+                SACCT_FORMAT,
+            ],
+        )
+        self.assertEqual({record.job_id for record in records}, {"4492653_1", "4492653_42"})
+        completed = next(record for record in records if record.job_id == "4492653_1")
+        self.assertEqual(completed.source, "sacct")
+        self.assertEqual(completed.end_text, "2026-06-28T09:26:33")
+        pending = next(record for record in records if record.job_id == "4492653_42")
+        self.assertEqual(pending.state, "PENDING")
+        self.assertEqual(pending.location, "pending: (Resources)")
+
+    def test_fetch_active_job_records_counts_completed_accounting_siblings(self):
+        client = SlurmClient(user="dgezgin")
+        fake_runner = FakeRunner(
+            [
+                (
+                    "4492653_3|direct-xcon-nsga2|RUNNING|nvgpu|h2node05|"
+                    "h2node05|00:10:00|2-00:00:00|1|4|gpu:h200:1|"
+                    "2026-06-28T08:37:36|2026-06-28T08:41:26\n"
+                    "4492653_4|direct-xcon-nsga2|PENDING|nvgpu||"
+                    "(Resources)|0:00|2-00:00:00|1|4|gpu:h200:1|"
+                    "2026-06-28T08:37:36|2026-06-28T16:53:08\n"
+                    "9999999_1|finished-array|COMPLETED|nvgpu|h2node01|"
+                    "None|00:10:00|2-00:00:00|1|4|gpu:h200:1|"
+                    "2026-06-28T07:00:00|2026-06-28T07:10:00\n"
+                ),
+                (
+                    "4492653_1|4492655|direct-xcon-nsga2|COMPLETED|nvgpu|"
+                    "h2node03|00:45:07|2-00:00:00|1|4|"
+                    "billing=4,cpu=4,gres/gpu=1,mem=96G,node=1|"
+                    "2026-06-28T08:37:36|2026-06-28T08:41:26|"
+                    "2026-06-28T09:26:33|0:0\n"
+                    "4492653_2|4492656|direct-xcon-nsga2|COMPLETED|nvgpu|"
+                    "h2node04|00:12:07|2-00:00:00|1|4|"
+                    "billing=4,cpu=4,gres/gpu=1,mem=96G,node=1|"
+                    "2026-06-28T08:37:36|2026-06-28T08:41:26|"
+                    "2026-06-28T09:00:33|0:0\n"
+                    "9999999_1|9999999|finished-array|COMPLETED|nvgpu|"
+                    "h2node01|00:10:00|2-00:00:00|1|4|"
+                    "billing=4,cpu=4,gres/gpu=1,mem=96G,node=1|"
+                    "2026-06-28T07:00:00|2026-06-28T07:10:00|"
+                    "2026-06-28T07:20:00|0:0\n"
+                ),
+            ]
+        )
+        client.runner = fake_runner
+
+        jobs, records = client.fetch_active_job_records()
+
+        self.assertEqual(
+            fake_runner.calls[1][0],
+            [
+                "sacct",
+                "-n",
+                "-P",
+                "-X",
+                "--array",
+                "-u",
+                "dgezgin",
+                "-S",
+                "2026-06-28T08:37:36",
+                "-o",
+                SACCT_FORMAT,
+            ],
+        )
+        self.assertEqual(
+            [job.job_id for job in jobs],
+            ["4492653_3", "4492653_4", "9999999_1"],
+        )
+        self.assertEqual(
+            {record.job_id for record in records},
+            {"4492653_1", "4492653_2", "4492653_3", "4492653_4"},
+        )
+        group = group_job_records(records)[0]
+        self.assertEqual(group.done_text, "2/4")
+        self.assertEqual(group.running, 1)
+        self.assertEqual(group.pending, 1)
+
     def test_parse_squeue_line_running_job(self):
         job = parse_squeue_line(
             "4340534_1|lcb-w2d-lr|RUNNING|nvgpu|h2xnode05|h2xnode05|19:21|"
@@ -78,6 +198,26 @@ class SlurmParsingTests(unittest.TestCase):
 
         self.assertEqual(job.location, "pending: Resources")
         self.assertEqual(summarize_jobs([job]), {"PENDING": 1})
+
+    def test_parse_sacct_line_completed_array_task(self):
+        record = parse_sacct_line(
+            "4492653_1|4492655|direct-xcon-nsga2|COMPLETED|nvgpu|h2node03|"
+            "00:45:07|2-00:00:00|1|4|"
+            "billing=4,cpu=4,gres/gpu=1,mem=96G,node=1|"
+            "2026-06-28T08:37:36|2026-06-28T08:41:26|"
+            "2026-06-28T09:26:33|0:0"
+        )
+
+        self.assertEqual(record.job_id, "4492653_1")
+        self.assertEqual(record.array_parent, "4492653")
+        self.assertEqual(record.end_text, "2026-06-28T09:26:33")
+        self.assertEqual(record.gpu_count, 1)
+        self.assertFalse(record.is_active)
+
+    def test_history_start_defaults_to_24h_for_unknown_window(self):
+        self.assertEqual(history_start("1h"), "now-1hours")
+        self.assertEqual(history_start("7d"), "now-7days")
+        self.assertEqual(history_start("bogus"), "now-24hours")
 
     def test_group_jobs_counts_array_progress_and_longest_running_task(self):
         jobs = [
@@ -117,6 +257,41 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertEqual(group.longest_running_elapsed, "2:11:04")
         self.assertEqual(group.limit, "4:00:00")
         self.assertEqual(group.dominant_state, "RUNNING")
+
+    def test_group_job_records_groups_recent_array_tasks_by_parent(self):
+        records = [
+            parse_sacct_line(
+                "4492653_1|4492655|direct-xcon-nsga2|COMPLETED|nvgpu|h2node03|"
+                "00:45:07|2-00:00:00|1|4|"
+                "billing=4,cpu=4,gres/gpu=1,mem=96G,node=1|"
+                "2026-06-28T08:37:36|2026-06-28T08:41:26|"
+                "2026-06-28T09:26:33|0:0"
+            ),
+            parse_sacct_line(
+                "4492653_2|4492656|direct-xcon-nsga2|FAILED|nvgpu|h2node04|"
+                "00:01:07|2-00:00:00|1|4|"
+                "billing=4,cpu=4,gres/gpu=1,mem=96G,node=1|"
+                "2026-06-28T08:37:36|2026-06-28T08:41:26|"
+                "2026-06-28T08:42:33|1:0"
+            ),
+            parse_sacct_line(
+                "4492653_3|4492657|direct-xcon-nsga2|RUNNING|nvgpu|h2node05|"
+                "00:10:00|2-00:00:00|1|4|"
+                "billing=4,cpu=4,gres/gpu=1,mem=96G,node=1|"
+                "2026-06-28T08:37:36|2026-06-28T08:41:26|Unknown|0:0"
+            ),
+        ]
+
+        groups = group_job_records(records)
+
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+        self.assertEqual(group.array_parent, "4492653")
+        self.assertEqual(group.done_text, "1/3")
+        self.assertEqual(group.running, 1)
+        self.assertEqual(group.failed, 1)
+        self.assertEqual(group.cpus, 12)
+        self.assertEqual(group.gpus, 3)
 
     def test_parse_elapsed_seconds_handles_slurm_elapsed_formats(self):
         self.assertEqual(parse_elapsed_seconds("45:19"), 2719)

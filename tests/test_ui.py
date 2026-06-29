@@ -1,7 +1,7 @@
 import curses
 import unittest
 
-from vaccs_running.slurm import Job, Node
+from vaccs_running.slurm import Job, JobRecord, Node
 from vaccs_running.ui import (
     VaccsRunningApp,
     command_text,
@@ -21,7 +21,13 @@ class FakeClient:
     def fetch_jobs(self):
         return []
 
+    def fetch_active_job_records(self):
+        return [], []
+
     def fetch_nodes(self):
+        return []
+
+    def fetch_job_history(self, window):
         return []
 
     def node_jobs(self, node_name):
@@ -122,6 +128,34 @@ def make_job(job_id, state="RUNNING", name="job", elapsed="0:01", limit="1:00:00
     )
 
 
+def make_record(
+    job_id,
+    state="COMPLETED",
+    name="hist-job",
+    elapsed="0:10:00",
+    limit="1:00:00",
+    end_time="2026-06-28T09:00:00",
+    tres="cpu=4,gres/gpu=1,mem=16G",
+):
+    return JobRecord(
+        job_id=job_id,
+        raw_job_id=job_id,
+        name=name,
+        state=state,
+        partition="nvgpu",
+        nodes="h2node01",
+        elapsed=elapsed,
+        limit=limit,
+        node_count="1",
+        cpus="4",
+        tres=tres,
+        submit_time="2026-06-28T08:00:00",
+        start_time="2026-06-28T08:10:00",
+        end_time=end_time,
+        exit_code="0:0",
+    )
+
+
 class NodeFilterTests(unittest.TestCase):
     def test_header_draws_jobs_and_nodes_tabs_on_top_bar_left(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
@@ -129,8 +163,11 @@ class NodeFilterTests(unittest.TestCase):
 
         app._draw_header(screen, 100)
 
-        self.assertIn((1, 2, " j Jobs ", curses.A_BOLD), screen.writes)
-        self.assertIn((1, 11, " n Nodes ", 0), screen.writes)
+        self.assertIn((1, 2, " r Running ", curses.A_BOLD), screen.writes)
+        self.assertIn((1, 14, " n Nodes ", 0), screen.writes)
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn(" h History ", written)
+        self.assertNotIn(" j Jobs ", written)
 
     def test_header_does_not_show_refresh_interval(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0.25)
@@ -150,6 +187,46 @@ class NodeFilterTests(unittest.TestCase):
 
         written = " ".join(write[2] for write in screen.writes)
         self.assertIn(" g group ", written)
+        self.assertIn(" c show-completed ", written)
+
+    def test_history_header_shows_filter_without_group_toggle(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="history")
+        screen = FakeScreen(height=12, width=120)
+
+        app._draw_header(screen, 120)
+
+        written = " ".join(write[2] for write in screen.writes)
+        self.assertIn(" f filter: 24h ", written)
+        self.assertNotIn(" g group ", written)
+        self.assertNotIn(" 1 1h ", written)
+        self.assertNotIn(" 3 3h ", written)
+
+    def test_accent_color_uses_requested_dc582a(self):
+        import vaccs_running.ui as ui
+
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        calls = []
+        missing = object()
+        original_colors = getattr(ui.curses, "COLORS", missing)
+        original_can_change = ui.curses.can_change_color
+        original_init_color = ui.curses.init_color
+        try:
+            ui.curses.COLORS = 256
+            ui.curses.can_change_color = lambda: True
+            ui.curses.init_color = lambda slot, red, green, blue: calls.append(
+                (slot, red, green, blue)
+            )
+
+            self.assertEqual(app._orange_color(), 16)
+        finally:
+            if original_colors is missing:
+                delattr(ui.curses, "COLORS")
+            else:
+                ui.curses.COLORS = original_colors
+            ui.curses.can_change_color = original_can_change
+            ui.curses.init_color = original_init_color
+
+        self.assertEqual(calls, [(16, 863, 345, 165)])
 
     def test_terminal_too_small_uses_minimum_size(self):
         self.assertTrue(terminal_too_small(69, 32))
@@ -179,7 +256,7 @@ class NodeFilterTests(unittest.TestCase):
             ),
             " Jobs: RUNNING:2 PENDING:1 FAILED:1 ",
         )
-        self.assertEqual(status_title("Nodes", {}, ["IDLE"]), " Nodes: none ")
+        self.assertEqual(status_title("Groups", {}, ["IDLE"]), " Groups: none ")
 
     def test_detail_lines_wrap_with_indent(self):
         wrapped = wrap_detail_lines(
@@ -200,21 +277,24 @@ class NodeFilterTests(unittest.TestCase):
 
         self.assertIn((5, 19, "╯", curses.A_DIM), screen.writes)
 
-    def test_jobs_table_title_includes_overall_job_status(self):
+    def test_jobs_table_title_includes_visible_running_job_status(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
         app.state.jobs = [
             make_job("1", "RUNNING"),
             make_job("2", "RUNNING"),
             make_job("3", "PENDING"),
+            make_job("4", "COMPLETED"),
         ]
         screen = FakeScreen(height=40, width=140)
 
         app._draw_jobs_table(screen, app._visible_jobs(), screen.height, screen.width)
 
         self.assertIn(
-            (5, 2, " Jobs: RUNNING:2 PENDING:1 ", curses.A_BOLD),
+            (5, 2, " RUNNING:2 PENDING:1 ", curses.A_BOLD),
             screen.writes,
         )
+        written = " ".join(write[2].strip() for write in screen.writes)
+        self.assertNotIn("COMPLETED", written)
 
     def test_jobs_table_hides_limit_before_cpus_when_narrow(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
@@ -242,16 +322,34 @@ class NodeFilterTests(unittest.TestCase):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
         app.state.jobs_grouped = True
         app.state.jobs = [
-            make_job("4413548_1", "COMPLETED", name="ae-pert-cand"),
             make_job(
-                "4413548_2",
+                "4413548_3",
                 "RUNNING",
                 name="ae-pert-cand",
                 elapsed="2:11:04",
                 limit="4:00:00",
             ),
-            make_job("4413548_3", "PENDING", name="ae-pert-cand"),
-            make_job("4413548_4", "FAILED", name="ae-pert-cand"),
+            make_job("4413548_4", "PENDING", name="ae-pert-cand"),
+        ]
+        app.state.job_records = [
+            make_record("4413548_1", "COMPLETED", name="ae-pert-cand", limit="4:00:00"),
+            make_record("4413548_2", "COMPLETED", name="ae-pert-cand", limit="4:00:00"),
+            make_record(
+                "4413548_3",
+                "RUNNING",
+                name="ae-pert-cand",
+                elapsed="2:11:04",
+                limit="4:00:00",
+                end_time="Unknown",
+            ),
+            make_record(
+                "4413548_4",
+                "PENDING",
+                name="ae-pert-cand",
+                elapsed="0:00",
+                limit="4:00:00",
+                end_time="Unknown",
+            ),
         ]
         screen = FakeScreen(height=40, width=140)
 
@@ -262,20 +360,112 @@ class NodeFilterTests(unittest.TestCase):
             screen.width,
         )
 
+        header = [
+            text.strip()
+            for y, _, text, _ in screen.writes
+            if y == 6 and text.strip() != "│"
+        ]
+        row = [
+            text.strip()
+            for y, _, text, _ in screen.writes
+            if y == 7 and text.strip() != "│"
+        ]
+        self.assertEqual(header[:6], ["JOBID", "JOB", "REQ", "DONE", "RUN", "PEND"])
+        self.assertIn("RUN_FOR", header)
+        self.assertNotIn("DONE/REQ", header)
+        self.assertEqual(row[:6], ["4413548", "ae-pert-cand", "4", "2", "1", "1"])
+        self.assertIn("2:11:04", row)
+
+    def test_history_view_draws_grouped_rows_by_default(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="history")
+        app.state.history = [
+            make_record("4492653_1", "COMPLETED", name="direct-xcon-nsga2"),
+            make_record(
+                "4492653_2",
+                "RUNNING",
+                name="direct-xcon-nsga2",
+                elapsed="0:22:00",
+                end_time="Unknown",
+            ),
+        ]
+        screen = FakeScreen(height=40, width=140)
+
+        app._draw(screen)
+
         written = " ".join(write[2].strip() for write in screen.writes)
-        self.assertIn("DONE/REQ", written)
-        self.assertIn("RUN_FOR", written)
-        self.assertIn("4413548", written)
-        self.assertIn("ae-pert-cand", written)
-        self.assertIn("1/4", written)
-        self.assertIn("2:11:04", written)
+        header = [
+            text.strip()
+            for y, _, text, _ in screen.writes
+            if y == 6 and text.strip() != "│"
+        ]
+        row = [
+            text.strip()
+            for y, _, text, _ in screen.writes
+            if y == 7 and text.strip() != "│"
+        ]
+        self.assertNotIn("History Groups", written)
+        self.assertNotIn("History:", written)
+        self.assertIn("RUNNING:1 COMPLETED:1", written)
+        self.assertEqual(header[:6], ["JOBID", "JOB", "REQ", "DONE", "RUN", "PEND"])
+        self.assertNotIn("DONE/ALL", header)
+        self.assertEqual(row[:5], ["4492653", "direct-xcon-nsga2", "2", "1", "1"])
+        self.assertIn("0:22:00", row)
+        self.assertIn("selected history group", written)
+        self.assertNotIn("selected task", written)
+
+    def test_grouped_history_table_shows_full_job_progress(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="history")
+        app.state.history = [
+            make_record("4492653_1", "COMPLETED", name="direct-xcon-nsga2"),
+            make_record("4492653_2", "FAILED", name="direct-xcon-nsga2"),
+            make_record(
+                "4492653_3",
+                "RUNNING",
+                name="direct-xcon-nsga2",
+                elapsed="0:22:00",
+                end_time="Unknown",
+            ),
+        ]
+        screen = FakeScreen(height=40, width=140)
+
+        app._draw_history_groups_table(
+            screen,
+            app._visible_history_groups(),
+            screen.height,
+            screen.width,
+        )
+
+        header = [
+            text.strip()
+            for y, _, text, _ in screen.writes
+            if y == 6 and text.strip() != "│"
+        ]
+        row = [
+            text.strip()
+            for y, _, text, _ in screen.writes
+            if y == 7 and text.strip() != "│"
+        ]
+        self.assertEqual(header[:6], ["JOBID", "JOB", "REQ", "DONE", "RUN", "PEND"])
+        self.assertNotIn("DONE/ALL", header)
+        self.assertEqual(row[:6], ["4492653", "direct-xcon-nsga2", "3", "1", "1", "0"])
+        self.assertIn("0:22:00", row)
 
     def test_grouped_job_detail_shows_requested_total(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
         app.state.jobs_grouped = True
+        app.state.jobs_show_completed = True
         app.state.jobs = [
             make_job("4413548_1", "COMPLETED", name="ae-pert-cand"),
             make_job("4413548_2", "RUNNING", name="ae-pert-cand"),
+        ]
+        app.state.job_records = [
+            make_record("4413548_1", "COMPLETED", name="ae-pert-cand"),
+            make_record(
+                "4413548_2",
+                "RUNNING",
+                name="ae-pert-cand",
+                end_time="Unknown",
+            ),
         ]
         screen = FakeScreen(height=40, width=120)
 
@@ -283,8 +473,8 @@ class NodeFilterTests(unittest.TestCase):
 
         written = " ".join(write[2] for write in screen.writes)
         self.assertIn("selected job group", written)
-        self.assertIn("completed=1/2", written)
         self.assertIn("requested=2", written)
+        self.assertIn("done=1", written)
 
     def test_nodes_table_title_includes_overall_node_status(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
@@ -298,7 +488,7 @@ class NodeFilterTests(unittest.TestCase):
         app._draw_nodes_table(screen, app._visible_nodes(), screen.height, screen.width)
 
         self.assertIn(
-            (5, 2, " Nodes: IDLE:1 MIXED:1 ALLOCATED:1 ", curses.A_BOLD),
+            (5, 2, " IDLE:1 MIXED:1 ALLOCATED:1 ", curses.A_BOLD),
             screen.writes,
         )
 
@@ -327,7 +517,7 @@ class NodeFilterTests(unittest.TestCase):
         self.assertIn("[", written)
         self.assertIn("]", written)
 
-    def test_j_and_n_switch_main_views(self):
+    def test_r_and_n_switch_main_views(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
 
         self.assertEqual(app.state.view, "jobs")
@@ -336,7 +526,77 @@ class NodeFilterTests(unittest.TestCase):
         self.assertEqual(app.state.view, "nodes")
 
         self.assertTrue(app._handle_key(None, ord("j")))
+        self.assertEqual(app.state.view, "nodes")
+
+        self.assertTrue(app._handle_key(None, ord("r")))
         self.assertEqual(app.state.view, "jobs")
+
+    def test_h_switches_to_history_and_unused_key_keeps_view(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+
+        self.assertTrue(app._handle_key(None, ord("h")))
+        self.assertEqual(app.state.view, "history")
+
+        self.assertTrue(app._handle_key(None, 111))
+        self.assertEqual(app.state.view, "history")
+
+    def test_history_direct_window_keys_do_not_refresh_selected_window(self):
+        class HistoryClient(FakeClient):
+            def __init__(self):
+                self.windows = []
+
+            def fetch_job_history(self, window):
+                self.windows.append(window)
+                return [make_record(f"job-{window}")]
+
+        client = HistoryClient()
+        app = VaccsRunningApp(client, refresh_seconds=0, initial_view="history")
+
+        self.assertTrue(app._handle_key(None, ord("1")))
+        self.assertEqual(app.state.history_window, "24h")
+        self.assertEqual(client.windows, [])
+
+        self.assertTrue(app._handle_key(None, ord("d")))
+        self.assertEqual(app.state.history_window, "24h")
+        self.assertEqual(client.windows, [])
+
+    def test_f_opens_history_filter_menu_and_applies_selected_window(self):
+        import vaccs_running.ui as ui
+
+        class HistoryClient(FakeClient):
+            def __init__(self):
+                self.windows = []
+
+            def fetch_job_history(self, window):
+                self.windows.append(window)
+                return [make_record(f"job-{window}")]
+
+        client = HistoryClient()
+        app = VaccsRunningApp(client, refresh_seconds=0, initial_view="history")
+        screen = FakeScreen(height=40, width=120)
+        popup = FakePopupWindow(keys=[curses.KEY_UP, ord("\n")])
+        original_newwin = curses.newwin
+        try:
+            def fake_newwin(height, width, top, left):
+                popup.height = height
+                popup.width = width
+                popup.positions.append((top, left))
+                return popup
+
+            curses.newwin = fake_newwin
+
+            self.assertTrue(app._handle_key(screen, ord("f")))
+        finally:
+            curses.newwin = original_newwin
+
+        self.assertEqual(app.state.history_window, "3h")
+        self.assertEqual(client.windows, ["3h"])
+        self.assertEqual(app.state.history[0].job_id, "job-3h")
+        written = " ".join(write[2] for write in popup.writes)
+        self.assertIn("history filter", written)
+        self.assertIn("last 3 hours", written)
+        self.assertIn("last 7 days", written)
+        self.assertNotIn("all time", written)
 
     def test_g_toggles_job_grouping_in_jobs_view(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
@@ -355,6 +615,67 @@ class NodeFilterTests(unittest.TestCase):
 
         self.assertFalse(app.state.jobs_grouped)
         self.assertEqual(app.state.message, "job grouping off")
+
+    def test_running_view_hides_completed_until_show_completed_is_enabled(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.jobs = [
+            make_job("4413548_1", "COMPLETED", name="active-array"),
+            make_job("4413548_2", "RUNNING", name="active-array"),
+            make_job("4413548_3", "PENDING", name="active-array"),
+            make_job("9999999_1", "COMPLETED", name="finished-array"),
+        ]
+
+        self.assertEqual(
+            [job.job_id for job in app._visible_jobs()],
+            ["4413548_2", "4413548_3"],
+        )
+
+        self.assertTrue(app._handle_key(None, ord("c")))
+
+        self.assertTrue(app.state.jobs_show_completed)
+        self.assertEqual(app.state.message, "show-completed on")
+        self.assertEqual(
+            [job.job_id for job in app._visible_jobs()],
+            ["4413548_1", "4413548_2", "4413548_3"],
+        )
+        self.assertNotIn("9999999_1", [job.job_id for job in app._visible_jobs()])
+
+    def test_show_completed_uses_accounting_records_for_active_jobs(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0)
+        app.state.jobs = [
+            make_job("4413548_2", "RUNNING", name="active-array"),
+            make_job("4413548_3", "PENDING", name="active-array"),
+        ]
+        app.state.job_records = [
+            make_record("4413548_1", "COMPLETED", name="active-array"),
+            make_record("4413548_2", "RUNNING", name="active-array", end_time="Unknown"),
+            make_record("4413548_3", "PENDING", name="active-array", end_time="Unknown"),
+            make_record("9999999_1", "COMPLETED", name="finished-array"),
+        ]
+
+        self.assertTrue(app._handle_key(None, ord("c")))
+
+        self.assertEqual(
+            [job.job_id for job in app._visible_jobs()],
+            ["4413548_2", "4413548_3", "4413548_1"],
+        )
+
+    def test_g_is_unused_in_history_view(self):
+        app = VaccsRunningApp(FakeClient(), refresh_seconds=0, initial_view="history")
+        app.state.history = [
+            make_record("4492653_1", "COMPLETED", name="direct-xcon-nsga2"),
+            make_record("4492654_1", "COMPLETED", name="other-job"),
+        ]
+        app.state.selected = 1
+        app.state.scroll = 0
+        app.state.message = "steady"
+
+        self.assertTrue(app._handle_key(None, ord("g")))
+
+        self.assertEqual(app.state.view, "history")
+        self.assertEqual(app.state.selected, 1)
+        self.assertEqual(app.state.scroll, 0)
+        self.assertEqual(app.state.message, "steady")
 
     def test_g_toggles_gpu_node_filter(self):
         app = VaccsRunningApp(FakeClient(), refresh_seconds=0)

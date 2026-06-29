@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
 from .slurm import SlurmClient, SlurmError
 from .ui import VaccsRunningApp
@@ -9,7 +10,7 @@ from .ui import VaccsRunningApp
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vaccs-running",
-        description="Terminal UI for viewing and managing your VACC Slurm jobs.",
+        description="Terminal UI for viewing VACC Slurm jobs and cluster status.",
     )
     parser.add_argument(
         "--user",

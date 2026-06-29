@@ -7,12 +7,16 @@ import time
 from dataclasses import dataclass
 
 from .slurm import (
+    HISTORY_WINDOWS,
     Job,
-    JobGroup,
+    JobRecord,
+    JobRecordGroup,
     Node,
     SlurmClient,
     SlurmError,
-    group_jobs,
+    group_job_records,
+    job_from_record,
+    summarize_job_records,
     summarize_jobs,
     summarize_nodes,
 )
@@ -24,6 +28,9 @@ STATE_COLORS = {
     "COMPLETED": 3,
     "FAILED": 4,
     "CANCELLED": 4,
+    "NODE_FAIL": 4,
+    "OUT_OF_MEMORY": 4,
+    "PREEMPTED": 4,
     "TIMEOUT": 4,
 }
 
@@ -44,12 +51,21 @@ MUTED_PAIR = 13
 SURFACE_PAIR = 14
 MIN_TERMINAL_WIDTH = 70
 MIN_TERMINAL_HEIGHT = 16
+HISTORY_FILTER_OPTIONS = [
+    ("1h", "last 1 hour"),
+    ("3h", "last 3 hours"),
+    ("24h", "last 24 hours"),
+    ("3d", "last 3 days"),
+    ("7d", "last 7 days"),
+]
 
 
 @dataclass
 class AppState:
     jobs: list[Job]
+    job_records: list[JobRecord]
     nodes: list[Node]
+    history: list[JobRecord]
     view: str = "jobs"
     selected: int = 0
     scroll: int = 0
@@ -58,6 +74,8 @@ class AppState:
     gpu_nodes_only: bool = False
     free_gpu_only: bool = False
     jobs_grouped: bool = False
+    jobs_show_completed: bool = False
+    history_window: str = "24h"
 
 
 class VaccsRunningApp:
@@ -71,8 +89,10 @@ class VaccsRunningApp:
         self.refresh_seconds = refresh_seconds
         self.state = AppState(
             jobs=[],
+            job_records=[],
             nodes=[],
-            view="nodes" if initial_view == "nodes" else "jobs",
+            history=[],
+            view=initial_view if initial_view in {"jobs", "history", "nodes"} else "jobs",
         )
         self.colors_enabled = False
 
@@ -137,7 +157,7 @@ class VaccsRunningApp:
             return None
 
     def _orange_color(self) -> int:
-        custom = self._custom_color(16, 851, 467, 341)  # #D97757
+        custom = self._custom_color(16, 863, 345, 165)  # #DC582A
         if custom is not None:
             return custom
         return 173 if curses.COLORS > 173 else curses.COLOR_YELLOW
@@ -155,7 +175,9 @@ class VaccsRunningApp:
         return curses.COLOR_WHITE
 
     def _refresh_current(self) -> None:
-        if self.state.view == "nodes":
+        if self.state.view == "history":
+            message = self._refresh_history()
+        elif self.state.view == "nodes":
             message = self._refresh_nodes()
         else:
             message = self._refresh_jobs()
@@ -165,7 +187,9 @@ class VaccsRunningApp:
 
     def _refresh_jobs(self) -> str:
         try:
-            self.state.jobs = self.client.fetch_jobs()
+            self.state.jobs, self.state.job_records = (
+                self.client.fetch_active_job_records()
+            )
             return f"{len(self.state.jobs)} jobs"
         except SlurmError as exc:
             return f"jobs: {exc}"
@@ -177,11 +201,48 @@ class VaccsRunningApp:
         except SlurmError as exc:
             return f"nodes: {exc}"
 
-    def _visible_jobs(self) -> list[Job]:
-        return self.state.jobs
+    def _refresh_history(self) -> str:
+        try:
+            self.state.history = self.client.fetch_job_history(
+                self.state.history_window
+            )
+            return f"{len(self.state.history)} tasks in {self.state.history_window}"
+        except SlurmError as exc:
+            return f"history: {exc}"
 
-    def _visible_job_groups(self) -> list[JobGroup]:
-        return group_jobs(self.state.jobs)
+    def _visible_jobs(self) -> list[Job]:
+        visible = filter_running_jobs(
+            self.state.jobs,
+            show_completed=False,
+        )
+        if not self.state.jobs_show_completed:
+            return visible
+        if not self.state.job_records:
+            return filter_running_jobs(
+                self.state.jobs,
+                show_completed=True,
+            )
+
+        visible_ids = {job.job_id for job in visible}
+        active_keys = {
+            job_group_key(job)
+            for job in self.state.jobs
+            if job.state.upper() in {"RUNNING", "PENDING"}
+        }
+        completed = [
+            job_from_record(record)
+            for record in self.state.job_records
+            if record.base_state == "COMPLETED"
+            and (record.array_parent, record.name) in active_keys
+            and record.job_id not in visible_ids
+        ]
+        return [*visible, *completed]
+
+    def _visible_job_groups(self) -> list[JobRecordGroup]:
+        return group_job_records(self.state.job_records)
+
+    def _visible_history_groups(self) -> list[JobRecordGroup]:
+        return group_job_records(self.state.history)
 
     def _visible_nodes(self) -> list[Node]:
         visible = self.state.nodes
@@ -194,6 +255,8 @@ class VaccsRunningApp:
     def _visible_count(self) -> int:
         if self.state.view == "nodes":
             return len(self._visible_nodes())
+        if self.state.view == "history":
+            return len(self._visible_history_groups())
         if self.state.jobs_grouped:
             return len(self._visible_job_groups())
         return len(self._visible_jobs())
@@ -219,7 +282,9 @@ class VaccsRunningApp:
             self.state.selected = self._visible_count() - 1
         elif key == ord("n"):
             self._switch_view("nodes")
-        elif key == ord("j"):
+        elif key == ord("h"):
+            self._switch_view("history")
+        elif key == ord("r"):
             self._switch_view("jobs")
         elif key == ord("g"):
             if self.state.view == "nodes":
@@ -231,12 +296,19 @@ class VaccsRunningApp:
                 self.state.scroll = 0
                 state = "on" if self.state.gpu_nodes_only else "off"
                 self.state.message = f"GPU node filter {state}"
-            else:
+            elif self.state.view == "jobs":
                 self.state.jobs_grouped = not self.state.jobs_grouped
                 self.state.selected = 0
                 self.state.scroll = 0
                 state = "on" if self.state.jobs_grouped else "off"
                 self.state.message = f"job grouping {state}"
+        elif key == ord("c"):
+            if self.state.view == "jobs":
+                self.state.jobs_show_completed = not self.state.jobs_show_completed
+                self.state.selected = 0
+                self.state.scroll = 0
+                state = "on" if self.state.jobs_show_completed else "off"
+                self.state.message = f"show-completed {state}"
         elif key == ord("f"):
             if self.state.view == "nodes":
                 enabled = not self.state.free_gpu_only
@@ -247,8 +319,11 @@ class VaccsRunningApp:
                 self.state.scroll = 0
                 state = "on" if self.state.free_gpu_only else "off"
                 self.state.message = f"free GPU filter {state}"
+            elif self.state.view == "history":
+                self._show_history_filter(stdscr)
         elif key == ord("d"):
-            self._show_detail(stdscr)
+            if self.state.view in {"jobs", "nodes"}:
+                self._show_detail(stdscr)
         elif key == ord("p"):
             if self.state.view == "nodes":
                 self._show_node_jobs(stdscr)
@@ -258,6 +333,15 @@ class VaccsRunningApp:
 
         self._clamp_selection()
         return True
+
+    def _set_history_window(self, window: str) -> None:
+        if window not in HISTORY_WINDOWS:
+            return
+        self.state.history_window = window
+        self.state.selected = 0
+        self.state.scroll = 0
+        self._refresh_history()
+        self._clamp_selection()
 
     def _page_size(self, stdscr: curses.window) -> int:
         height, _ = stdscr.getmaxyx()
@@ -307,10 +391,17 @@ class VaccsRunningApp:
         self._clamp_selection()
         return visible[self.state.selected]
 
-    def _selected_job_group(self) -> JobGroup | None:
+    def _selected_job_group(self) -> JobRecordGroup | None:
         if not self.state.jobs_grouped:
             return None
         visible = self._visible_job_groups()
+        if not visible:
+            return None
+        self._clamp_selection()
+        return visible[self.state.selected]
+
+    def _selected_history_group(self) -> JobRecordGroup | None:
+        visible = self._visible_history_groups()
         if not visible:
             return None
         self._clamp_selection()
@@ -334,6 +425,14 @@ class VaccsRunningApp:
         if self.state.view == "nodes":
             self._draw_nodes_table(stdscr, self._visible_nodes(), height, width)
             self._draw_node_detail(stdscr, height, width)
+        elif self.state.view == "history":
+            self._draw_history_groups_table(
+                stdscr,
+                self._visible_history_groups(),
+                height,
+                width,
+            )
+            self._draw_history_group_detail(stdscr, height, width)
         elif self.state.jobs_grouped:
             self._draw_job_groups_table(
                 stdscr,
@@ -375,14 +474,32 @@ class VaccsRunningApp:
         right = time.strftime("%H:%M:%S")
         self._draw_box(stdscr, 0, 0, 3, width)
 
-        jobs_attr = self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD if self.state.view == "jobs" else self._pair(MUTED_PAIR)
-        nodes_attr = self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD if self.state.view == "nodes" else self._pair(MUTED_PAIR)
-        self._addstr(stdscr, 1, 2, " j Jobs ", jobs_attr)
-        self._addstr(stdscr, 1, 11, " n Nodes ", nodes_attr)
-        title_x = max(1, (width - len(title)) // 2)
-        self._addstr(stdscr, 1, title_x, title[: max(0, width - 2)], self._pair(TITLE_PAIR) | curses.A_BOLD)
+        x = 2
+        for view, label in [
+            ("jobs", " r Running "),
+            ("nodes", " n Nodes "),
+            ("history", " h History "),
+        ]:
+            attr = (
+                self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD
+                if self.state.view == view
+                else self._pair(MUTED_PAIR)
+            )
+            self._addstr(stdscr, 1, x, label, attr)
+            x += len(label) + 1
+
+        title_x = max(x, (width - len(title)) // 2)
+        right_x = width - len(right) - 2
+        if title_x + len(title) < right_x:
+            self._addstr(
+                stdscr,
+                1,
+                title_x,
+                title,
+                self._pair(TITLE_PAIR) | curses.A_BOLD,
+            )
         if width > len(right) + 2:
-            self._addstr(stdscr, 1, width - len(right) - 2, right, self._pair(MUTED_PAIR))
+            self._addstr(stdscr, 1, right_x, right, self._pair(MUTED_PAIR))
         if self.state.view == "nodes":
             x = 1
             gpu_filter_text = " g gpu-nodes "
@@ -410,6 +527,12 @@ class VaccsRunningApp:
             self._addstr(stdscr, 3, x, " i usage ", self._pair(MUTED_PAIR))
             x += len(" i usage ") + 1
             self._addstr(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR))
+        elif self.state.view == "history":
+            x = 1
+            filter_text = f" f filter: {history_window_short_label(self.state.history_window)} "
+            self._addstr(stdscr, 3, x, filter_text, self._pair(MUTED_PAIR))
+            x += len(filter_text) + 1
+            self._addstr(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR))
         else:
             x = 1
             group_text = " g group "
@@ -421,6 +544,17 @@ class VaccsRunningApp:
                 self._pair(ACTIVE_TAB_PAIR if self.state.jobs_grouped else MUTED_PAIR),
             )
             x += len(group_text) + 1
+            completed_text = " c show-completed "
+            self._addstr(
+                stdscr,
+                3,
+                x,
+                completed_text,
+                self._pair(
+                    ACTIVE_TAB_PAIR if self.state.jobs_show_completed else MUTED_PAIR
+                ),
+            )
+            x += len(completed_text) + 1
             self._addstr(stdscr, 3, x, " d detail ", self._pair(MUTED_PAIR))
             x += len(" d detail ") + 1
             self._addstr(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR))
@@ -435,10 +569,9 @@ class VaccsRunningApp:
         table_top = 5
         detail_height = min(8, max(4, height // 4))
         table_height = max(4, height - detail_height - table_top)
-        title = status_title(
-            "Jobs",
-            summarize_jobs(self.state.jobs),
-            ["RUNNING", "PENDING", "FAILED", "CANCELLED"],
+        title = summary_title(
+            summarize_jobs(visible),
+            ["RUNNING", "PENDING", "COMPLETED"],
         )
         self._draw_box(stdscr, table_top, 0, table_height, width, title)
         header_y = table_top + 1
@@ -505,7 +638,7 @@ class VaccsRunningApp:
     def _draw_job_groups_table(
         self,
         stdscr: curses.window,
-        visible: list[JobGroup],
+        visible: list[JobRecordGroup],
         height: int,
         width: int,
     ) -> None:
@@ -513,9 +646,9 @@ class VaccsRunningApp:
         detail_height = min(8, max(4, height // 4))
         table_height = max(4, height - detail_height - table_top)
         title = status_title(
-            "Job Groups",
-            summarize_jobs(self.state.jobs),
-            ["RUNNING", "PENDING", "COMPLETED", "FAILED", "CANCELLED"],
+            "Running Groups",
+            summarize_jobs(self._visible_jobs()),
+            ["RUNNING", "PENDING", "COMPLETED"],
         )
         self._draw_box(stdscr, table_top, 0, table_height, width, title)
         header_y = table_top + 1
@@ -591,6 +724,79 @@ class VaccsRunningApp:
                     )
                 x += size + 1
 
+    def _draw_history_groups_table(
+        self,
+        stdscr: curses.window,
+        visible: list[JobRecordGroup],
+        height: int,
+        width: int,
+    ) -> None:
+        table_top = 5
+        detail_height = min(8, max(4, height // 4))
+        table_height = max(4, height - detail_height - table_top)
+        title = summary_title(
+            summarize_job_records(self.state.history),
+            ["RUNNING", "PENDING", "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"],
+        )
+        self._draw_box(stdscr, table_top, 0, table_height, width, title)
+        header_y = table_top + 1
+        first_row = table_top + 2
+        rows = max(0, table_height - 3)
+        available_width = max(1, width - 4)
+        specs = responsive_history_group_specs(available_width)
+        row_values = [
+            [value_fn(group) for _, _, _, value_fn in specs]
+            for group in visible
+        ]
+        columns = fit_columns(label_widths(specs), row_values, available_width)
+        x = 2
+        for (label, _, _, _), size in zip(specs, columns):
+            self._addstr(
+                stdscr,
+                header_y,
+                x,
+                label[:size].ljust(size),
+                self._pair(MUTED_PAIR) | curses.A_BOLD,
+            )
+            x += size + 1
+
+        if self.state.selected < self.state.scroll:
+            self.state.scroll = self.state.selected
+        if self.state.selected >= self.state.scroll + rows:
+            self.state.scroll = self.state.selected - rows + 1
+        page_label = page_status(self.state.selected, len(visible), rows)
+        if page_label:
+            footer = f" {page_label} "
+            footer_x = max(2, width - len(footer) - 2)
+            self._addstr(
+                stdscr,
+                table_top + table_height - 1,
+                footer_x,
+                footer,
+                self._pair(5) | curses.A_BOLD,
+            )
+
+        for screen_row, group in enumerate(
+            visible[self.state.scroll : self.state.scroll + rows],
+            start=first_row,
+        ):
+            index = self.state.scroll + screen_row - first_row
+            attr = self._state_attr(group.dominant_state)
+            if index == self.state.selected:
+                attr |= curses.A_REVERSE
+            x = 2
+            for (_, _, _, value_fn), size in zip(specs, columns):
+                text = value_fn(group)[:size].ljust(size)
+                if x < width:
+                    self._addstr(
+                        stdscr,
+                        screen_row,
+                        x,
+                        text[: max(0, width - x - 1)],
+                        attr,
+                    )
+                x += size + 1
+
     def _draw_nodes_table(
         self,
         stdscr: curses.window,
@@ -601,8 +807,7 @@ class VaccsRunningApp:
         table_top = 5
         detail_height = min(8, max(4, height // 4))
         table_height = max(4, height - detail_height - table_top)
-        title = status_title(
-            "Nodes",
+        title = summary_title(
             summarize_nodes(self.state.nodes),
             ["IDLE", "MIXED", "ALLOCATED", "DOWN"],
         )
@@ -804,13 +1009,50 @@ class VaccsRunningApp:
         lines = [
             f"{group.name}  array-parent={group.array_parent}",
             (
-                f"completed={group.completed}/{group.total}  requested={group.total} "
+                f"requested={group.total}  done={group.completed} "
                 f"running={group.running}  pending={group.pending}  failed={group.failed}"
             ),
             (
                 f"longest-running={group.longest_running_elapsed}  "
                 f"limit={group.limit}  other={group.other}"
             ),
+        ]
+        body_rows = max(0, min(height - 1, top + panel_height - 1) - top - 1)
+        wrapped = wrap_detail_lines(lines, max(1, width - 4))
+        for offset, line in enumerate(wrapped[:body_rows]):
+            self._addstr(
+                stdscr,
+                top + 1 + offset,
+                2,
+                line,
+                self._state_attr(group.dominant_state),
+            )
+
+    def _draw_history_group_detail(
+        self,
+        stdscr: curses.window,
+        height: int,
+        width: int,
+    ) -> None:
+        panel_height = min(8, max(4, height // 4))
+        top = max(4, height - panel_height)
+        group = self._selected_history_group()
+        self._draw_box(stdscr, top, 0, panel_height, width, " selected history group ")
+        if not group:
+            self._addstr(stdscr, top + 1, 2, "No history groups found.", self._pair(2))
+            return
+
+        lines = [
+            f"{group.name}  array-parent={group.array_parent}",
+            (
+                f"requested={group.total}  done={group.completed}  running={group.running} "
+                f"pending={group.pending}  failed={group.failed}  other={group.other}"
+            ),
+            (
+                f"resources: cpus={group.cpus}  gpus={group.gpus} "
+                f"limit={group.limit}"
+            ),
+            f"submitted={group.submit_time}  latest-end={group.end_time or '-'}",
         ]
         body_rows = max(0, min(height - 1, top + panel_height - 1) - top - 1)
         wrapped = wrap_detail_lines(lines, max(1, width - 4))
@@ -958,6 +1200,48 @@ class VaccsRunningApp:
             close_keys=(ord("i"),),
         )
 
+    def _show_history_filter(self, stdscr: curses.window) -> None:
+        current_windows = [window for window, _ in HISTORY_FILTER_OPTIONS]
+        selected = max(0, current_windows.index(self.state.history_window))
+        height, width = stdscr.getmaxyx()
+        footer = " up/down select  enter apply  q close "
+        content_width = max(
+            len("history filter") + 4,
+            len(footer),
+            *(len(label) + len(window) + 6 for window, label in HISTORY_FILTER_OPTIONS),
+        )
+        box_width = min(max(36, content_width + 4), max(20, width - 8))
+        box_height = len(HISTORY_FILTER_OPTIONS) + 4
+        top = max(1, (height - box_height) // 2)
+        left = max(1, (width - box_width) // 2)
+        win = curses.newwin(box_height, box_width, top, left)
+        win.keypad(True)
+        win.nodelay(False)
+
+        while True:
+            win.erase()
+            win.border()
+            self._addstr(win, 0, 2, " history filter ", self._pair(6) | curses.A_BOLD)
+            for row, (window, label) in enumerate(HISTORY_FILTER_OPTIONS, start=2):
+                marker = ">" if row - 2 == selected else " "
+                current = "*" if window == self.state.history_window else " "
+                text = f"{marker} {label:<14} {window:>3} {current}"
+                attr = self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD if row - 2 == selected else self._pair(MUTED_PAIR)
+                self._addstr(win, row, 2, text[: box_width - 4], attr)
+            self._addstr(win, box_height - 1, 2, footer[: box_width - 4], self._pair(5))
+            win.refresh()
+
+            key = win.getch()
+            if key in (ord("q"), 27, ord("f")):
+                return
+            if key in (ord("\n"), curses.KEY_ENTER):
+                self._set_history_window(HISTORY_FILTER_OPTIONS[selected][0])
+                return
+            if key in (curses.KEY_DOWN, ord("j")):
+                selected = min(len(HISTORY_FILTER_OPTIONS) - 1, selected + 1)
+            elif key in (curses.KEY_UP, ord("k")):
+                selected = max(0, selected - 1)
+
     def _popup_command(
         self,
         stdscr: curses.window,
@@ -1088,6 +1372,15 @@ def popup_geometry(
 
 
 def status_title(label: str, summary: dict[str, int], preferred: list[str]) -> str:
+    suffix = state_summary_text(summary, preferred)
+    return f" {label}: {suffix} "
+
+
+def summary_title(summary: dict[str, int], preferred: list[str]) -> str:
+    return f" {state_summary_text(summary, preferred)} "
+
+
+def state_summary_text(summary: dict[str, int], preferred: list[str]) -> str:
     bits: list[str] = []
     seen: set[str] = set()
     for key in preferred:
@@ -1097,8 +1390,7 @@ def status_title(label: str, summary: dict[str, int], preferred: list[str]) -> s
     for key, value in sorted(summary.items()):
         if key not in seen and value:
             bits.append(f"{key}:{value}")
-    suffix = " ".join(bits) if bits else "none"
-    return f" {label}: {suffix} "
+    return " ".join(bits) if bits else "none"
 
 
 def meter(percent: float, width: int) -> str:
@@ -1156,6 +1448,34 @@ def terminal_too_small(width: int, height: int) -> bool:
     return width < MIN_TERMINAL_WIDTH or height < MIN_TERMINAL_HEIGHT
 
 
+def history_window_short_label(window: str) -> str:
+    return window
+
+
+def filter_running_jobs(jobs: list[Job], *, show_completed: bool) -> list[Job]:
+    active_keys = {
+        job_group_key(job)
+        for job in jobs
+        if job.state.upper() in {"RUNNING", "PENDING"}
+    }
+    visible: list[Job] = []
+    for job in jobs:
+        state = job.state.upper()
+        if state in {"RUNNING", "PENDING"}:
+            visible.append(job)
+        elif (
+            show_completed
+            and state == "COMPLETED"
+            and job_group_key(job) in active_keys
+        ):
+            visible.append(job)
+    return visible
+
+
+def job_group_key(job: Job) -> tuple[str, str]:
+    return (job.array_parent, job.name)
+
+
 def responsive_job_specs(
     available_width: int,
 ) -> list[tuple[str, int, int, Callable[[Job], str]]]:
@@ -1180,12 +1500,12 @@ def responsive_job_specs(
 
 def responsive_job_group_specs(
     available_width: int,
-) -> list[tuple[str, int, int, Callable[[JobGroup], str]]]:
-    specs: list[tuple[str, int, int, Callable[[JobGroup], str]]] = [
+) -> list[tuple[str, int, int, Callable[[JobRecordGroup], str]]]:
+    specs: list[tuple[str, int, int, Callable[[JobRecordGroup], str]]] = [
         ("JOBID", 10, 16, lambda group: group.array_parent),
         ("JOB", 12, 28, lambda group: group.name),
-        ("DONE/REQ", 8, 10, lambda group: group.done_text),
         ("REQ", 3, 5, lambda group: str(group.total)),
+        ("DONE", 4, 5, lambda group: str(group.completed)),
         ("RUN", 3, 5, lambda group: str(group.running)),
         ("PEND", 4, 5, lambda group: str(group.pending)),
         ("FAIL", 4, 5, lambda group: str(group.failed)),
@@ -1195,6 +1515,32 @@ def responsive_job_group_specs(
     if minimum_table_width(label_widths(specs)) <= available_width:
         return specs
     return [spec for spec in specs if spec[0] != "LIMIT"]
+
+
+def responsive_history_group_specs(
+    available_width: int,
+) -> list[tuple[str, int, int, Callable[[JobRecordGroup], str]]]:
+    specs: list[tuple[str, int, int, Callable[[JobRecordGroup], str]]] = [
+        ("JOBID", 10, 16, lambda group: group.array_parent),
+        ("JOB", 12, 28, lambda group: group.name),
+        ("REQ", 3, 5, lambda group: str(group.total)),
+        ("DONE", 4, 5, lambda group: str(group.completed)),
+        ("RUN", 3, 5, lambda group: str(group.running)),
+        ("PEND", 4, 5, lambda group: str(group.pending)),
+        ("FAIL", 4, 5, lambda group: str(group.failed)),
+        ("CPUS", 4, 6, lambda group: str(group.cpus)),
+        ("GPUS", 4, 6, lambda group: str(group.gpus)),
+        ("RUN_FOR", 7, 12, lambda group: group.longest_running_elapsed),
+        ("LIMIT", 8, 14, lambda group: group.limit),
+    ]
+    if minimum_table_width(label_widths(specs)) <= available_width:
+        return specs
+
+    specs = [spec for spec in specs if spec[0] != "LIMIT"]
+    if minimum_table_width(label_widths(specs)) <= available_width:
+        return specs
+
+    return [spec for spec in specs if spec[0] not in {"CPUS", "GPUS"}]
 
 
 def responsive_node_specs(
@@ -1229,8 +1575,7 @@ def responsive_node_specs(
 
 
 def label_widths(
-    specs: list[tuple[str, int, int, Callable[[Job], str]]]
-    | list[tuple[str, int, int, Callable[[JobGroup], str]]],
+    specs: list[tuple[str, int, int, Callable[..., str]]],
 ) -> list[tuple[str, int, int]]:
     return [(label, min_width, max_width) for label, min_width, max_width, _ in specs]
 
