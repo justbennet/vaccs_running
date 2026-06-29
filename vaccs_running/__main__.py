@@ -19,8 +19,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--refresh",
         type=float,
-        default=0.25,
-        help="Auto-refresh interval in seconds. Use 0 to disable. Default: 0.25.",
+        default=2.0,
+        help="Auto-refresh interval in seconds. Use 0 to disable. Default: 2.0.",
     )
     return parser
 

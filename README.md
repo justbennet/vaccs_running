@@ -26,12 +26,14 @@ From this directory:
 ./vaccs-running
 ```
 
-The TUI auto-refreshes the active view every 0.25 seconds by default. To change
+The TUI auto-refreshes the active view every 2 seconds by default. To change
 that:
 
 ```bash
-./vaccs-running --refresh 2
+./vaccs-running --refresh 1
 ```
+
+> ⚠️  As auto-refresh queries Slurm, please use an interval larger than 1 second.
 
 ## Install As A Command
 
