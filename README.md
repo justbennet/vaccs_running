@@ -1,4 +1,11 @@
-# VACC's Running?
+<h1 align="center">VACC's Running?</h1>
+
+<p align="center">
+  <img alt="Supported Python versions" src="https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue">
+  <a href="https://github.com/deringezgin/vaccs_running/actions/workflows/ci.yml">
+    <img alt="CI" src="https://github.com/deringezgin/vaccs_running/actions/workflows/ci.yml/badge.svg">
+  </a>
+</p>
 
 A colorful terminal UI for checking your jobs on the Vermont Advanced Computing Cluster and viewing the node availability.
 
