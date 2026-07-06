@@ -8,6 +8,7 @@ from vaccs_running.slurm import (
     format_node_jobs,
     format_user_usage,
     free_gpu_count,
+    stranded_gpu_count,
     group_job_records,
     group_jobs,
     history_start,
@@ -353,6 +354,55 @@ NodeName=cpu01 Arch=x86_64 CoresPerSocket=32
         self.assertTrue(nodes[0].is_debug_gpu_node)
         self.assertEqual(free_gpu_count(nodes), 3)
 
+    def test_idle_gpus_on_full_cpu_node_are_not_free(self):
+        nodes = parse_scontrol_nodes(
+            """NodeName=r6node01 Arch=x86_64 CoresPerSocket=96
+   CPUAlloc=192 CPUTot=192 CPULoad=190.0
+   Gres=gpu:rtx6000:8
+   RealMemory=1000000 AllocMem=65536 FreeMem=900000
+   State=ALLOCATED ThreadsPerCore=1
+   Partitions=nvgpu
+   AllocTRES=cpu=192,mem=64G,gres/gpu=2
+"""
+        )
+
+        node = nodes[0]
+        self.assertEqual(node.free_cpus, 0)
+        self.assertEqual(node.gpu_text, "2/8")
+        self.assertEqual(node.gpu_free, 0)
+        self.assertEqual(free_gpu_count(nodes), 0)
+        self.assertEqual(stranded_gpu_count(nodes), 6)
+
+    def test_stranded_gpu_count_only_counts_full_cpu_gpu_nodes(self):
+        nodes = parse_scontrol_nodes(
+            """NodeName=r6node01 Arch=x86_64 CoresPerSocket=96
+   CPUAlloc=192 CPUTot=192 CPULoad=190.0
+   Gres=gpu:rtx6000:8
+   RealMemory=1000000 AllocMem=65536 FreeMem=900000
+   State=ALLOCATED ThreadsPerCore=1
+   Partitions=nvgpu
+   AllocTRES=cpu=192,mem=64G,gres/gpu=2
+NodeName=h2node01 Arch=x86_64 CoresPerSocket=96
+   CPUAlloc=13 CPUTot=192 CPULoad=4.74
+   Gres=gpu:h200:4
+   RealMemory=1000000 AllocMem=198656 FreeMem=942714
+   State=MIXED ThreadsPerCore=1
+   Partitions=nvgpu
+   AllocTRES=cpu=13,mem=194G,gres/gpu=1
+NodeName=gpudebug01 Arch=x86_64 CoresPerSocket=64
+   CPUAlloc=128 CPUTot=128 CPULoad=100.0
+   Gres=gpu:a100:2
+   RealMemory=1000000 AllocMem=0 FreeMem=966060
+   State=ALLOCATED ThreadsPerCore=1
+   Partitions=gpu-debug
+   AllocTRES=cpu=128
+"""
+        )
+
+        # Only the fully CPU-allocated non-debug GPU node contributes: 8 - 2 = 6.
+        self.assertEqual(stranded_gpu_count(nodes), 6)
+        self.assertEqual(free_gpu_count(nodes), 3)
+
     def test_node_jobs_queries_selected_node(self):
         client = SlurmClient(user="dgezgin")
         fake_runner = FakeRunner(
@@ -555,6 +605,36 @@ NodeName=h2node01 Arch=x86_64 CoresPerSocket=96
         )
 
         self.assertEqual(free_index, total_index + 1)
+        self.assertRegex(lines[free_index].rstrip(), r"^FREE\s+-\s+-\s+7$")
+
+    def test_format_user_usage_renders_allocated_row_before_free(self):
+        usage = aggregate_user_usage(
+            [
+                {
+                    "job_id": "1",
+                    "user": "alice",
+                    "cpus": "4",
+                    "tres": "cpu=4,gres/gpu=1",
+                    "memory": "N/A",
+                }
+            ]
+        )
+
+        text = format_user_usage(usage, free_gpus=7, allocated_gpus=6)
+        lines = text.splitlines()
+        total_index = next(
+            index for index, line in enumerate(lines) if line.startswith("TOTAL")
+        )
+        allocated_index = next(
+            index for index, line in enumerate(lines) if line.startswith("ALLOCATED")
+        )
+        free_index = next(
+            index for index, line in enumerate(lines) if line.startswith("FREE")
+        )
+
+        self.assertEqual(allocated_index, total_index + 1)
+        self.assertEqual(free_index, allocated_index + 1)
+        self.assertRegex(lines[allocated_index].rstrip(), r"^ALLOCATED\s+-\s+-\s+6$")
         self.assertRegex(lines[free_index].rstrip(), r"^FREE\s+-\s+-\s+7$")
 
     def test_parse_scontrol_job_usage_counts_running_alloc_tres(self):

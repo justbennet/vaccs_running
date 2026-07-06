@@ -294,6 +294,10 @@ class Node:
 
     @property
     def gpu_free(self) -> int:
+        # A GPU is only schedulable when the node still has a free CPU core, so
+        # idle GPUs on a fully CPU-allocated node are effectively unavailable.
+        if self.free_cpus == 0:
+            return 0
         return max(0, self.gpu_total - self.gpu_alloc)
 
     @property
@@ -436,8 +440,14 @@ class SlurmClient:
         job_output = self.runner.run(["scontrol", "show", "job"], timeout=20.0)
         node_output = self.runner.run(["scontrol", "show", "node"], timeout=20.0)
         usage = parse_scontrol_job_usage(job_output)
-        free_gpus = free_gpu_count(parse_scontrol_nodes(node_output))
-        return format_user_usage(aggregate_user_usage(usage), free_gpus=free_gpus)
+        nodes = parse_scontrol_nodes(node_output)
+        free_gpus = free_gpu_count(nodes)
+        allocated_gpus = stranded_gpu_count(nodes)
+        return format_user_usage(
+            aggregate_user_usage(usage),
+            free_gpus=free_gpus,
+            allocated_gpus=allocated_gpus,
+        )
 
 
 def parse_squeue_line(line: str) -> Job:
@@ -793,7 +803,20 @@ def free_gpu_count(nodes: Iterable[Node]) -> int:
     )
 
 
-def format_user_usage(usage: list[UserUsage], free_gpus: int | None = None) -> str:
+def stranded_gpu_count(nodes: Iterable[Node]) -> int:
+    """Count idle GPUs that cannot be scheduled because their node has no free CPU core."""
+    return sum(
+        max(0, node.gpu_total - node.gpu_alloc)
+        for node in nodes
+        if node.has_gpus and not node.is_debug_gpu_node and node.free_cpus == 0
+    )
+
+
+def format_user_usage(
+    usage: list[UserUsage],
+    free_gpus: int | None = None,
+    allocated_gpus: int | None = None,
+) -> str:
     if not usage and free_gpus is None:
         return "No running tasks found."
 
@@ -834,16 +857,17 @@ def format_user_usage(usage: list[UserUsage], free_gpus: int | None = None) -> s
     if show_memory:
         total["memory"] = human_mb(total_memory)
     rows.append(total)
-    if free_gpus is not None:
-        free = {
-            "user": "FREE",
-            "tasks": "-",
-            "cpus": "-",
-            "gpus": str(free_gpus),
-        }
+
+    def summary_row(label: str, gpus: int) -> dict[str, str]:
+        row = {"user": label, "tasks": "-", "cpus": "-", "gpus": str(gpus)}
         if show_memory:
-            free["memory"] = "-"
-        rows.append(free)
+            row["memory"] = "-"
+        return row
+
+    if allocated_gpus is not None:
+        rows.append(summary_row("ALLOCATED", allocated_gpus))
+    if free_gpus is not None:
+        rows.append(summary_row("FREE", free_gpus))
 
     widths = [
         max(len(label), *(len(row[key]) for row in rows))
