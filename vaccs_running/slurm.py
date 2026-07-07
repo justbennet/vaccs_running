@@ -31,9 +31,12 @@ SQUEUE_FIELDS = [
     "gres",
     "submit_time",
     "start_time",
+    "user",
+    "group",
 ]
 
-SQUEUE_FORMAT = "%i|%j|%T|%P|%N|%R|%M|%l|%D|%C|%b|%V|%S"
+SQUEUE_FORMAT = "%i|%j|%T|%P|%N|%R|%M|%l|%D|%C|%b|%V|%S|%u|%g"
+FILTER_CHOICES_FORMAT = "%u|%g"
 SACCT_FIELDS = [
     "job_id",
     "raw_job_id",
@@ -65,6 +68,8 @@ NODE_JOBS_FIELDS = [
     "name",
 ]
 NODE_JOBS_FORMAT = "%i|%u|%T|%M|%C|%b|%j"
+DEFAULT_SQUEUE_STATES = "all"
+SQUEUE_STATE_RE = re.compile(r"[A-Z_]+")
 
 class SlurmError(RuntimeError):
     pass
@@ -85,6 +90,8 @@ class Job:
     gres: str
     submit_time: str
     start_time: str
+    user: str = ""
+    group: str = ""
 
     @property
     def array_parent(self) -> str:
@@ -152,6 +159,8 @@ class JobRecord:
     exit_code: str
     reason: str = ""
     source: str = "sacct"
+    user: str = ""
+    group: str = ""
 
     @property
     def array_parent(self) -> str:
@@ -216,6 +225,8 @@ class JobRecordGroup:
     end_time: str
     cpus: int
     gpus: int
+    user: str = ""
+    group: str = ""
 
     @property
     def done_text(self) -> str:
@@ -320,6 +331,12 @@ class UserUsage:
     memory_mb: int | None = None
 
 
+@dataclass(frozen=True)
+class JobFilterChoices:
+    users: list[str]
+    groups: list[str]
+
+
 class CommandRunner:
     def run(self, args: Iterable[str], timeout: float = 12.0) -> str:
         argv = list(args)
@@ -345,34 +362,121 @@ class CommandRunner:
 
 
 class SlurmClient:
-    def __init__(self, user: str | None = None):
+    def __init__(self, user: str | None = None, states: str | None = None):
         self.user = user or os.environ.get("USER") or getpass.getuser()
+        self.job_users: set[str] = {self.user}
+        self.job_groups: set[str] = set()
+        self.job_all_principals = False
+        self.squeue_states = normalize_squeue_states(states)
         self.runner = CommandRunner()
 
-    def fetch_jobs(self) -> list[Job]:
-        output = self.runner.run(
-            [
-                "squeue",
-                "--array",
-                "-h",
-                "-u",
-                self.user,
-                "-t",
-                "all",
-                "-o",
-                SQUEUE_FORMAT,
-            ],
-            timeout=15.0,
+    @property
+    def state_filter_active(self) -> bool:
+        return self.squeue_states.lower() != DEFAULT_SQUEUE_STATES
+
+    @property
+    def job_user_filter_active(self) -> bool:
+        return (
+            self.job_all_principals
+            or self.job_groups
+            or self.job_users != {self.user}
         )
+
+    @property
+    def job_user_label(self) -> str:
+        if self.job_all_principals:
+            return "all users"
+        bits: list[str] = []
+        if self.job_users:
+            bits.append(plural_label(len(self.job_users), "user"))
+        if self.job_groups:
+            bits.append(plural_label(len(self.job_groups), "group"))
+        return " ".join(bits) if bits else "me"
+
+    @property
+    def job_filter_active(self) -> bool:
+        return self.state_filter_active or self.job_user_filter_active
+
+    def set_job_state_filter(self, states: str | None) -> None:
+        self.squeue_states = normalize_squeue_states(states)
+
+    def set_job_user_filter(self, user: str | None) -> None:
+        if user is None:
+            self.set_job_principal_filters(all_principals=True)
+            return
+        stripped = user.strip()
+        if not stripped or stripped.lower() in {"all", "*"}:
+            self.set_job_principal_filters(all_principals=True)
+            return
+        if stripped in {"@", "me"}:
+            self.set_job_principal_filters(users={self.user})
+            return
+        self.set_job_principal_filters(users={stripped})
+
+    def set_job_principal_filters(
+        self,
+        users: Iterable[str] | None = None,
+        groups: Iterable[str] | None = None,
+        *,
+        all_principals: bool = False,
+    ) -> None:
+        self.job_all_principals = all_principals
+        self.job_users = {
+            user.strip()
+            for user in (users or [])
+            if user and user.strip()
+        }
+        self.job_groups = {
+            group.strip()
+            for group in (groups or [])
+            if group and group.strip()
+        }
+        if not self.job_all_principals and not self.job_users and not self.job_groups:
+            self.job_users = {self.user}
+
+    def clear_job_filters(self) -> None:
+        self.squeue_states = DEFAULT_SQUEUE_STATES
+        self.set_job_principal_filters(users={self.user})
+
+    def fetch_jobs(self, states: str | None = None) -> list[Job]:
+        squeue_states = (
+            self.squeue_states
+            if states is None
+            else normalize_squeue_states(states)
+        )
+        output = self._fetch_jobs(squeue_states, self._query_users())
         jobs: list[Job] = []
         for line in output.splitlines():
             if not line.strip():
                 continue
             jobs.append(parse_squeue_line(line))
+        return self._filter_jobs_by_principals(jobs)
+
+    def _query_users(self) -> set[str] | None:
+        if self.job_all_principals or self.job_groups:
+            return None
+        return set(self.job_users or {self.user})
+
+    def _filter_jobs_by_principals(self, jobs: list[Job]) -> list[Job]:
+        if self.job_groups:
+            groups = self.job_groups
+            return [job for job in jobs if job.group in groups]
+        if self.job_all_principals:
+            return jobs
         return jobs
+
+    def _fetch_jobs(self, states: str, users: Iterable[str] | None) -> str:
+        args = ["squeue", "--array", "-h"]
+        user_list = sorted(user for user in (users or []) if user)
+        if user_list:
+            args.extend(["-u", ",".join(user_list)])
+        args.extend(["-t", states, "-o", SQUEUE_FORMAT])
+        return self.runner.run(args, timeout=15.0)
 
     def fetch_active_job_records(self) -> tuple[list[Job], list[JobRecord]]:
         jobs = self.fetch_jobs()
+        if self.job_filter_active:
+            return jobs, [record_from_job(job) for job in jobs]
         if not active_job_keys(jobs):
             return jobs, []
         return (
@@ -384,7 +488,11 @@ class SlurmClient:
         )
 
     def fetch_job_history(self, window: str) -> list[JobRecord]:
-        jobs = self.fetch_jobs()
+        jobs = [
+            parse_squeue_line(line)
+            for line in self._fetch_jobs(DEFAULT_SQUEUE_STATES, {self.user}).splitlines()
+            if line.strip()
+        ]
         live_records = [record_from_job(job) for job in jobs]
         records_by_id = {
             record.job_id: record
@@ -415,12 +523,43 @@ class SlurmClient:
         )
         return parse_sacct_records(output)
 
+    def fetch_running_filter_choices(self) -> JobFilterChoices:
+        output = self.runner.run(
+            [
+                "squeue",
+                "--array",
+                "-h",
+                "-t",
+                "R",
+                "-o",
+                FILTER_CHOICES_FORMAT,
+            ],
+            timeout=15.0,
+        )
+        users: set[str] = set()
+        groups: set[str] = set()
+        for line in output.splitlines():
+            user, _, group = line.partition("|")
+            user = user.strip()
+            group = group.strip()
+            if user:
+                users.add(user)
+            if group:
+                groups.add(group)
+        return JobFilterChoices(users=sorted(users), groups=sorted(groups))
+
     def fetch_nodes(self) -> list[Node]:
         output = self.runner.run(["scontrol", "show", "node"], timeout=20.0)
         return parse_scontrol_nodes(output)
 
     def show_job(self, job_id: str) -> str:
         return self.runner.run(["scontrol", "show", "job", job_id], timeout=12.0)
+
+    def show_job_script(self, job_id: str) -> str:
+        return self.runner.run(
+            ["scontrol", "write", "batch_script", job_id, "-"],
+            timeout=12.0,
+        )
 
     def show_node(self, node_name: str) -> str:
         return self.runner.run(["scontrol", "show", "node", node_name], timeout=12.0)
@@ -504,6 +643,8 @@ def record_from_job(job: Job) -> JobRecord:
         exit_code="",
         reason=job.reason,
         source="squeue",
+        user=job.user,
+        group=job.group,
     )
 
 
@@ -522,6 +663,8 @@ def job_from_record(record: JobRecord) -> Job:
         gres=record.tres,
         submit_time=record.submit_time,
         start_time=record.start_time,
+        user=record.user,
+        group=record.group,
     )
 
 
@@ -632,6 +775,25 @@ def state_base(state: str) -> str:
     return state.upper().split(maxsplit=1)[0] or "UNKNOWN"
 
 
+def normalize_squeue_states(states: str | None) -> str:
+    if states is None:
+        return DEFAULT_SQUEUE_STATES
+
+    tokens: list[str] = []
+    for token in re.split(r"[,\s]+", states.strip().strip("'\"")):
+        token = token.strip().strip("'\"")
+        if not token:
+            continue
+        if token.lower() == DEFAULT_SQUEUE_STATES:
+            return DEFAULT_SQUEUE_STATES
+        normalized = token.upper()
+        if not SQUEUE_STATE_RE.fullmatch(normalized):
+            raise ValueError(f"invalid Slurm state: {token!r}")
+        tokens.append(normalized)
+
+    return ",".join(tokens) if tokens else DEFAULT_SQUEUE_STATES
+
+
 def active_job_keys(jobs: Iterable[Job]) -> set[tuple[str, str]]:
     return {
         job_key(job)
@@ -711,11 +873,17 @@ def group_job_records(records: Iterable[JobRecord]) -> list[JobRecordGroup]:
                 "end_time": record.end_text,
                 "cpus": 0,
                 "gpus": 0,
+                "users": set(),
+                "groups": set(),
             },
         )
         group["total"] = int(group["total"]) + 1
         group["cpus"] = int(group["cpus"]) + parse_int(record.cpus)
         group["gpus"] = int(group["gpus"]) + record.gpu_count
+        if record.user:
+            group["users"].add(record.user)
+        if record.group:
+            group["groups"].add(record.group)
         if record.submit_time and (
             not group["submit_time"] or record.submit_time < str(group["submit_time"])
         ):
@@ -757,6 +925,8 @@ def group_job_records(records: Iterable[JobRecord]) -> list[JobRecordGroup]:
             end_time=str(group["end_time"]),
             cpus=int(group["cpus"]),
             gpus=int(group["gpus"]),
+            user=single_or_mixed_label(group["users"]),
+            group=single_or_mixed_label(group["groups"]),
         )
         for group in groups.values()
     ]
@@ -1004,6 +1174,19 @@ def parse_int(value: str) -> int:
         return int(value)
     except ValueError:
         return 0
+
+
+def plural_label(count: int, singular: str) -> str:
+    suffix = "" if count == 1 else "s"
+    return f"{count} {singular}{suffix}"
+
+
+def single_or_mixed_label(values: set[str]) -> str:
+    if not values:
+        return ""
+    if len(values) == 1:
+        return next(iter(values))
+    return "mixed"
 
 
 def parse_gpu_count(value: str) -> int:

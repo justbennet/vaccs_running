@@ -9,13 +9,16 @@ from dataclasses import dataclass
 from .slurm import (
     HISTORY_WINDOWS,
     Job,
+    JobFilterChoices,
     JobRecord,
     JobRecordGroup,
     Node,
     SlurmClient,
     SlurmError,
     group_job_records,
-    job_from_record,
+    plural_label,
+    record_from_job,
+    state_base,
     summarize_job_records,
     summarize_jobs,
     summarize_nodes,
@@ -59,6 +62,33 @@ HISTORY_FILTER_OPTIONS = [
     ("3d", "last 3 days"),
     ("7d", "last 7 days"),
 ]
+JOB_STATE_FILTER_OPTIONS = [
+    ("BF", "BOOT_FAIL"),
+    ("CA", "CANCELLED"),
+    ("CD", "COMPLETED"),
+    ("CF", "CONFIGURING"),
+    ("CG", "COMPLETING"),
+    ("DL", "DEADLINE"),
+    ("F", "FAILED"),
+    ("NF", "NODE_FAIL"),
+    ("OOM", "OUT_OF_MEMORY"),
+    ("PD", "PENDING"),
+    ("PR", "PREEMPTED"),
+    ("R", "RUNNING"),
+    ("RD", "RESV_DEL_HOLD"),
+    ("RF", "REQUEUE_FED"),
+    ("RH", "REQUEUE_HOLD"),
+    ("RQ", "REQUEUED"),
+    ("RS", "RESIZING"),
+    ("RV", "REVOKED"),
+    ("SI", "SIGNALING"),
+    ("SE", "SPECIAL_EXIT"),
+    ("SO", "STAGE_OUT"),
+    ("ST", "STOPPED"),
+    ("S", "SUSPENDED"),
+    ("TO", "TIMEOUT"),
+]
+JOB_STATE_CODES = [state for state, _ in JOB_STATE_FILTER_OPTIONS]
 
 
 @dataclass
@@ -75,7 +105,6 @@ class AppState:
     gpu_nodes_only: bool = False
     free_gpu_only: bool = False
     jobs_grouped: bool = False
-    jobs_show_completed: bool = False
     history_window: str = "24h"
 
 
@@ -218,38 +247,41 @@ class VaccsRunningApp:
             return f"history: {exc}"
 
     def _visible_jobs(self) -> list[Job]:
-        visible = filter_running_jobs(
-            self.state.jobs,
-            show_completed=False,
-        )
-        if not self.state.jobs_show_completed:
-            return visible
-        if not self.state.job_records:
-            return filter_running_jobs(
-                self.state.jobs,
-                show_completed=True,
-            )
+        if self._jobs_filter_active():
+            return self.state.jobs
 
-        visible_ids = {job.job_id for job in visible}
-        active_keys = {
-            job_group_key(job)
-            for job in self.state.jobs
-            if job.state.upper() in {"RUNNING", "PENDING"}
-        }
-        completed = [
-            job_from_record(record)
-            for record in self.state.job_records
-            if record.base_state == "COMPLETED"
-            and (record.array_parent, record.name) in active_keys
-            and record.job_id not in visible_ids
-        ]
-        return [*visible, *completed]
+        return filter_running_jobs(self.state.jobs)
 
     def _visible_job_groups(self) -> list[JobRecordGroup]:
+        if self._jobs_filter_active() and not self.state.job_records:
+            return group_job_records(record_from_job(job) for job in self.state.jobs)
         return group_job_records(self.state.job_records)
 
     def _visible_history_groups(self) -> list[JobRecordGroup]:
         return group_job_records(self.state.history)
+
+    def _squeue_state_filter(self) -> str:
+        return str(getattr(self.client, "squeue_states", "all") or "all")
+
+    def _squeue_state_filter_active(self) -> bool:
+        active = getattr(self.client, "state_filter_active", None)
+        if active is not None:
+            return bool(active)
+        return self._squeue_state_filter().lower() != "all"
+
+    def _job_user_filter_active(self) -> bool:
+        active = getattr(self.client, "job_user_filter_active", None)
+        return bool(active) if active is not None else False
+
+    def _jobs_filter_active(self) -> bool:
+        return self._squeue_state_filter_active() or self._job_user_filter_active()
+
+    def _show_job_principal_columns(self) -> bool:
+        return (
+            self._job_all_principals()
+            or len(self._selected_job_users()) > 1
+            or bool(self._selected_job_groups())
+        )
 
     def _visible_nodes(self) -> list[Node]:
         visible = self.state.nodes
@@ -309,13 +341,6 @@ class VaccsRunningApp:
                 self.state.scroll = 0
                 state = "on" if self.state.jobs_grouped else "off"
                 self.state.message = f"job grouping {state}"
-        elif key == ord("c"):
-            if self.state.view == "jobs":
-                self.state.jobs_show_completed = not self.state.jobs_show_completed
-                self.state.selected = 0
-                self.state.scroll = 0
-                state = "on" if self.state.jobs_show_completed else "off"
-                self.state.message = f"show-completed {state}"
         elif key == ord("f"):
             if self.state.view == "nodes":
                 enabled = not self.state.free_gpu_only
@@ -326,11 +351,16 @@ class VaccsRunningApp:
                 self.state.scroll = 0
                 state = "on" if self.state.free_gpu_only else "off"
                 self.state.message = f"free GPU filter {state}"
+            elif self.state.view == "jobs":
+                self._show_jobs_filter(stdscr)
             elif self.state.view == "history":
                 self._show_history_filter(stdscr)
         elif key == ord("d"):
             if self.state.view in {"jobs", "nodes"}:
                 self._show_detail(stdscr)
+        elif key == ord("s"):
+            if self.state.view == "jobs":
+                self._show_job_script(stdscr)
         elif key == ord("p"):
             if self.state.view == "nodes":
                 self._show_node_jobs(stdscr)
@@ -551,19 +581,34 @@ class VaccsRunningApp:
                 self._pair(ACTIVE_TAB_PAIR if self.state.jobs_grouped else MUTED_PAIR),
             )
             x += len(group_text) + 1
-            completed_text = " c show-completed "
+            filter_text = " f filter "
             self._addstr(
                 stdscr,
                 3,
                 x,
-                completed_text,
-                self._pair(
-                    ACTIVE_TAB_PAIR if self.state.jobs_show_completed else MUTED_PAIR
-                ),
+                filter_text,
+                self._pair(ACTIVE_TAB_PAIR if self._jobs_filter_active() else MUTED_PAIR),
             )
-            x += len(completed_text) + 1
+            x += len(filter_text) + 1
+            if self._squeue_state_filter_active():
+                state_text = f" state: {job_state_filter_label(self._squeue_state_filter())} "
+                self._addstr(stdscr, 3, x, state_text, self._pair(ACTIVE_TAB_PAIR))
+                x += len(state_text) + 1
+            if self._job_user_filter_active():
+                user_summary = self._job_user_summary()
+                group_summary = self._job_group_summary()
+                if user_summary != "me":
+                    user_text = f" user: {user_summary} "
+                    self._addstr(stdscr, 3, x, user_text, self._pair(ACTIVE_TAB_PAIR))
+                    x += len(user_text) + 1
+                if group_summary != "none":
+                    group_text = f" group: {group_summary} "
+                    self._addstr(stdscr, 3, x, group_text, self._pair(ACTIVE_TAB_PAIR))
+                    x += len(group_text) + 1
             self._addstr(stdscr, 3, x, " d detail ", self._pair(MUTED_PAIR))
             x += len(" d detail ") + 1
+            self._addstr(stdscr, 3, x, " s script ", self._pair(MUTED_PAIR))
+            x += len(" s script ") + 1
             self._addstr(stdscr, 3, x, " q quit", self._pair(MUTED_PAIR))
 
     def _draw_jobs_table(
@@ -585,7 +630,10 @@ class VaccsRunningApp:
         first_row = table_top + 2
         rows = max(0, table_height - 3)
         available_width = max(1, width - 4)
-        job_specs = responsive_job_specs(available_width)
+        job_specs = responsive_job_specs(
+            available_width,
+            show_principals=self._show_job_principal_columns(),
+        )
         row_values = [
             [value_fn(job) for _, _, _, value_fn in job_specs]
             for job in visible
@@ -662,7 +710,10 @@ class VaccsRunningApp:
         first_row = table_top + 2
         rows = max(0, table_height - 3)
         available_width = max(1, width - 4)
-        group_specs = responsive_job_group_specs(available_width)
+        group_specs = responsive_job_group_specs(
+            available_width,
+            show_principals=self._show_job_principal_columns(),
+        )
         row_values = [
             [value_fn(group) for _, _, _, value_fn in group_specs]
             for group in visible
@@ -1187,6 +1238,45 @@ class VaccsRunningApp:
             close_keys=(ord("d"),),
         )
 
+    def _show_job_script(self, stdscr: curses.window) -> None:
+        job_id = self._selected_job_script_id()
+        if not job_id:
+            return
+        self._popup_command(
+            stdscr,
+            f"scontrol write batch_script {job_id} -",
+            self.client.show_job_script,
+            job_id,
+            close_keys=(ord("s"),),
+        )
+
+    def _selected_job_script_id(self) -> str | None:
+        job = self._selected_job()
+        if job:
+            return job.array_parent
+
+        group = self._selected_job_group()
+        if not group:
+            return None
+
+        matching_jobs = [
+            job
+            for job in self.state.jobs
+            if job.array_parent == group.array_parent and job.name == group.name
+        ]
+        if matching_jobs:
+            return sorted(matching_jobs, key=job_script_target_sort_key)[0].array_parent
+
+        matching_records = [
+            record
+            for record in self.state.job_records
+            if record.array_parent == group.array_parent and record.name == group.name
+        ]
+        if matching_records:
+            return sorted(matching_records, key=record_script_target_sort_key)[0].array_parent
+
+        return group.array_parent
+
     def _show_node_jobs(self, stdscr: curses.window) -> None:
         node = self._selected_node()
         if not node:
@@ -1206,6 +1296,581 @@ class VaccsRunningApp:
             command_text(lambda _: self.client.cluster_usage(), ""),
             close_keys=(ord("i"),),
         )
+
+    def _show_jobs_filter(self, stdscr: curses.window) -> None:
+        choices = self._fetch_job_filter_choices()
+        self._run_jobs_filter_menu(
+            stdscr,
+            "running filter",
+            lambda: self._jobs_filter_home_items(),
+            lambda win, height, width, item: self._activate_jobs_filter_home_item(
+                stdscr,
+                choices,
+                item,
+            ),
+            " enter/click open  c clear  q close ",
+            close_keys=(ord("f"),),
+        )
+
+    def _fetch_job_filter_choices(self) -> JobFilterChoices:
+        fetch = getattr(self.client, "fetch_running_filter_choices", None)
+        if not fetch:
+            return JobFilterChoices(users=[], groups=[])
+        try:
+            return fetch()
+        except SlurmError:
+            return JobFilterChoices(users=[], groups=[])
+
+    def _run_jobs_filter_menu(
+        self,
+        stdscr: curses.window,
+        title: str,
+        items_fn,
+        activate_fn,
+        footer: str,
+        close_keys: tuple[int, ...] = (),
+    ) -> None:
+        selected = 0
+        scroll = 0
+        height, width = stdscr.getmaxyx()
+        content_width = max(len(title) + 4, len(footer), 58)
+        box_width = min(max(44, content_width + 4), max(20, width - 8))
+        box_height = min(max(8, height - 4), 28)
+        body_height = max(1, box_height - 4)
+        top = max(1, (height - box_height) // 2)
+        left = max(1, (width - box_width) // 2)
+        win = curses.newwin(box_height, box_width, top, left)
+        win.keypad(True)
+        win.nodelay(False)
+        safe_mousemask()
+
+        while True:
+            items = items_fn()
+            selectable_indexes = [
+                index for index, item in enumerate(items) if item["kind"] != "separator"
+            ]
+            if not selectable_indexes:
+                return
+            if selected not in selectable_indexes:
+                selected = selectable_indexes[0]
+            selected_position = selectable_indexes.index(selected)
+            selected_position = max(0, min(selected_position, len(selectable_indexes) - 1))
+            selected = selectable_indexes[selected_position]
+            if selected < scroll:
+                scroll = selected
+            if selected >= scroll + body_height:
+                scroll = selected - body_height + 1
+
+            win.erase()
+            win.border()
+            self._addstr(win, 0, 2, f" {title} ", self._pair(6) | curses.A_BOLD)
+            hitboxes = []
+            for offset, item in enumerate(items[scroll : scroll + body_height], start=1):
+                item_index = scroll + offset - 1
+                if item["kind"] == "separator":
+                    self._addstr(
+                        win,
+                        offset,
+                        2,
+                        str(item["label"])[: box_width - 4],
+                        self._pair(MUTED_PAIR) | curses.A_BOLD,
+                    )
+                    continue
+                marker = ">" if item_index == selected else " "
+                prefix = ""
+                if "checked" in item:
+                    prefix = "[x] " if item.get("checked") else "[ ] "
+                text = f"{marker} {prefix}{item['label']}"
+                attr = (
+                    self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD
+                    if item_index == selected
+                    else self._pair(MUTED_PAIR)
+                )
+                self._addstr(win, offset, 2, text[: box_width - 4], attr)
+                hitboxes.append((top + offset, left + 1, left + box_width - 2, item_index))
+            self._addstr(win, box_height - 1, 2, footer[: box_width - 4], self._pair(5))
+            win.refresh()
+
+            key = win.getch()
+            if key in (ord("q"), 27, *close_keys):
+                return
+            if key in (curses.KEY_DOWN, ord("j")):
+                selected_position = min(len(selectable_indexes) - 1, selected_position + 1)
+                selected = selectable_indexes[selected_position]
+            elif key in (curses.KEY_UP, ord("k")):
+                selected_position = max(0, selected_position - 1)
+                selected = selectable_indexes[selected_position]
+            elif key == curses.KEY_NPAGE:
+                selected_position = min(
+                    len(selectable_indexes) - 1,
+                    selected_position + body_height,
+                )
+                selected = selectable_indexes[selected_position]
+            elif key == curses.KEY_PPAGE:
+                selected_position = max(0, selected_position - body_height)
+                selected = selectable_indexes[selected_position]
+            elif key in (ord("\n"), curses.KEY_ENTER, ord(" ")):
+                activate_fn(win, box_height, box_width, items[selected])
+            elif key == ord("c"):
+                self._clear_job_filters()
+            elif key in (ord("s"), ord("u"), ord("g")):
+                shortcut_actions = {
+                    ord("s"): ("status",),
+                    ord("u"): ("custom_user", "user"),
+                    ord("g"): ("custom_group", "group"),
+                }
+                for action in shortcut_actions[key]:
+                    match = next(
+                        (
+                            index
+                            for index in selectable_indexes
+                            if items[index].get("action") == action
+                        ),
+                        None,
+                    )
+                    if match is not None:
+                        selected = match
+                        activate_fn(win, box_height, box_width, items[match])
+                        break
+            elif key == curses.KEY_MOUSE:
+                mouse = safe_getmouse()
+                if mouse:
+                    _, mouse_x, mouse_y, _, button_state = mouse
+                    if button_state & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
+                        for y, x_min, x_max, item_index in hitboxes:
+                            if mouse_y == y and x_min <= mouse_x <= x_max:
+                                selected = item_index
+                                activate_fn(win, box_height, box_width, items[item_index])
+                                break
+
+    def _jobs_filter_home_items(self) -> list[dict[str, object]]:
+        return [
+            {
+                "kind": "submenu",
+                "action": "status",
+                "label": f"Filter by status: {job_state_filter_label(self._squeue_state_filter())}",
+            },
+            {
+                "kind": "submenu",
+                "action": "user",
+                "label": f"Filter by user: {self._job_user_summary()}",
+            },
+            {
+                "kind": "submenu",
+                "action": "group",
+                "label": f"Filter by group: {self._job_group_summary()}",
+            },
+        ]
+
+    def _activate_jobs_filter_home_item(
+        self,
+        stdscr: curses.window,
+        choices: JobFilterChoices,
+        item: dict[str, object],
+    ) -> None:
+        action = item.get("action")
+        if action == "status":
+            self._show_jobs_status_filter(stdscr)
+        elif action == "user":
+            self._show_jobs_user_filter(stdscr, choices)
+        elif action == "group":
+            self._show_jobs_group_filter(stdscr, choices)
+
+    def _show_jobs_status_filter(self, stdscr: curses.window) -> None:
+        self._run_jobs_filter_menu(
+            stdscr,
+            "filter by status",
+            self._jobs_status_filter_items,
+            self._activate_jobs_status_filter_item,
+            " enter/space toggle  c clear  q back ",
+            close_keys=(ord("f"),),
+        )
+
+    def _show_jobs_user_filter(
+        self,
+        stdscr: curses.window,
+        choices: JobFilterChoices,
+    ) -> None:
+        self._run_jobs_filter_menu(
+            stdscr,
+            "filter by user",
+            lambda: self._jobs_user_filter_items(choices),
+            lambda win, height, width, item: self._activate_jobs_user_filter_item(
+                win,
+                height,
+                width,
+                choices,
+                item,
+            ),
+            " enter/click toggle  c clear  q back ",
+            close_keys=(ord("f"),),
+        )
+
+    def _show_jobs_group_filter(
+        self,
+        stdscr: curses.window,
+        choices: JobFilterChoices,
+    ) -> None:
+        self._run_jobs_filter_menu(
+            stdscr,
+            "filter by group",
+            lambda: self._jobs_group_filter_items(choices),
+            lambda win, height, width, item: self._activate_jobs_group_filter_item(
+                win,
+                height,
+                width,
+                choices,
+                item,
+            ),
+            " enter/click select  c clear  q back ",
+            close_keys=(ord("f"),),
+        )
+
+    def _jobs_status_filter_items(self) -> list[dict[str, object]]:
+        selected_states = self._selected_job_state_codes()
+        items: list[dict[str, object]] = []
+        for code, label in JOB_STATE_FILTER_OPTIONS:
+            items.append(
+                {
+                    "kind": "state",
+                    "value": code,
+                    "label": f"{code:<3} {label}",
+                    "checked": code in selected_states,
+                }
+            )
+        return items
+
+    def _jobs_user_filter_items(self, choices: JobFilterChoices) -> list[dict[str, object]]:
+        selected_users = self._selected_job_users()
+        all_principals = self._job_all_principals()
+        default_user = str(getattr(self.client, "user", "me") or "me")
+        items: list[dict[str, object]] = [
+            {
+                "kind": "action",
+                "action": "users_all",
+                "label": "Select all",
+                "checked": bool(choices.users) and selected_users == set(choices.users),
+            },
+            {
+                "kind": "action",
+                "action": "users_clear",
+                "label": f"Clear all (only {default_user})",
+                "checked": not all_principals and not selected_users,
+            },
+            {
+                "kind": "action",
+                "action": "custom_user",
+                "label": "Enter user name...",
+            },
+        ]
+        for user in choices.users:
+            items.append(
+                {
+                    "kind": "user",
+                    "value": user,
+                    "label": user,
+                    "checked": not all_principals and user in selected_users,
+                }
+            )
+        return items
+
+    def _jobs_group_filter_items(self, choices: JobFilterChoices) -> list[dict[str, object]]:
+        selected_groups = self._selected_job_groups()
+        items: list[dict[str, object]] = [
+            {
+                "kind": "action",
+                "action": "groups_all",
+                "label": "Select all",
+                "checked": bool(choices.groups) and selected_groups == set(choices.groups),
+            },
+            {
+                "kind": "action",
+                "action": "groups_clear",
+                "label": "Clear all",
+                "checked": not selected_groups,
+            },
+            {
+                "kind": "action",
+                "action": "custom_group",
+                "label": "Enter group name...",
+            },
+        ]
+        for group in choices.groups:
+            items.append(
+                {
+                    "kind": "group",
+                    "value": group,
+                    "label": group,
+                    "checked": group in selected_groups,
+                }
+            )
+        return items
+
+    def _activate_jobs_status_filter_item(
+        self,
+        win: curses.window,
+        box_height: int,
+        box_width: int,
+        item: dict[str, object],
+    ) -> None:
+        kind = item["kind"]
+        if kind == "state":
+            states = self._selected_job_state_codes()
+            value = str(item["value"])
+            if value in states:
+                states.remove(value)
+            else:
+                states.add(value)
+            self._set_job_state_codes(states)
+        self._refresh_jobs_after_filter_change()
+
+    def _activate_jobs_user_filter_item(
+        self,
+        win: curses.window,
+        box_height: int,
+        box_width: int,
+        choices: JobFilterChoices,
+        item: dict[str, object],
+    ) -> None:
+        kind = item["kind"]
+        action = item.get("action")
+        if kind == "user":
+            users = self._selected_job_users()
+            value = str(item["value"])
+            if value in users:
+                users.remove(value)
+            else:
+                users.add(value)
+            self._set_job_principal_filters(users, self._selected_job_groups())
+        elif action == "users_all":
+            self._set_job_principal_filters(
+                set(choices.users),
+                self._selected_job_groups(),
+            )
+        elif action == "users_clear":
+            self._set_job_principal_filters(set(), self._selected_job_groups())
+        elif action == "custom_user":
+            value = self._read_jobs_filter_choice(
+                win,
+                box_height,
+                box_width,
+                "user",
+                choices.users,
+            )
+            if value:
+                if value not in choices.users:
+                    choices.users.append(value)
+                    choices.users.sort()
+                self._set_job_principal_filters({value}, set())
+        self._refresh_jobs_after_filter_change()
+
+    def _activate_jobs_group_filter_item(
+        self,
+        win: curses.window,
+        box_height: int,
+        box_width: int,
+        choices: JobFilterChoices,
+        item: dict[str, object],
+    ) -> None:
+        kind = item["kind"]
+        action = item.get("action")
+        if kind == "group":
+            groups = self._selected_job_groups()
+            value = str(item["value"])
+            if value in groups:
+                groups.remove(value)
+            else:
+                groups.add(value)
+            self._set_job_principal_filters(self._selected_job_users(), groups)
+        elif action == "groups_all":
+            self._set_job_principal_filters(
+                self._selected_job_users(),
+                set(choices.groups),
+            )
+        elif action == "groups_clear":
+            self._set_job_principal_filters(self._selected_job_users(), set())
+        elif action == "custom_group":
+            value = self._read_jobs_filter_choice(
+                win,
+                box_height,
+                box_width,
+                "group",
+                choices.groups,
+            )
+            if value:
+                if value not in choices.groups:
+                    choices.groups.append(value)
+                    choices.groups.sort()
+                self._set_job_principal_filters(set(), {value})
+        self._refresh_jobs_after_filter_change()
+
+    def _clear_job_filters(self) -> None:
+        clear = getattr(self.client, "clear_job_filters", None)
+        if clear:
+            clear()
+        else:
+            self.client.squeue_states = "all"
+        self._refresh_jobs_after_filter_change()
+
+    def _refresh_jobs_after_filter_change(self) -> None:
+        self._refresh_jobs()
+        self.state.selected = 0
+        self.state.scroll = 0
+        self._clamp_selection()
+
+    def _set_job_state_filter(self, states: str) -> None:
+        setter = getattr(self.client, "set_job_state_filter", None)
+        if setter:
+            setter(states)
+        else:
+            self.client.squeue_states = states
+
+    def _set_job_state_codes(self, states: set[str]) -> None:
+        ordered = [state for state in JOB_STATE_CODES if state in states]
+        self._set_job_state_filter(",".join(ordered) if ordered else "all")
+
+    def _set_job_principal_filters(
+        self,
+        users: set[str],
+        groups: set[str],
+        *,
+        all_principals: bool = False,
+    ) -> None:
+        setter = getattr(self.client, "set_job_principal_filters", None)
+        if setter:
+            setter(users, groups, all_principals=all_principals)
+
+    def _selected_job_state_codes(self) -> set[str]:
+        states = self._squeue_state_filter()
+        if states.lower() == "all":
+            return set()
+        return {
+            state.strip().upper()
+            for state in states.split(",")
+            if state.strip()
+        }
+
+    def _selected_job_users(self) -> set[str]:
+        users = set(getattr(self.client, "job_users", set()) or set())
+        groups = self._selected_job_groups()
+        all_principals = self._job_all_principals()
+        default_user = str(getattr(self.client, "user", ""))
+        if not all_principals and not groups and users == {default_user}:
+            return set()
+        return users
+
+    def _selected_job_groups(self) -> set[str]:
+        return set(getattr(self.client, "job_groups", set()) or set())
+
+    def _job_all_principals(self) -> bool:
+        return bool(getattr(self.client, "job_all_principals", False))
+
+    def _job_user_summary(self) -> str:
+        if self._job_all_principals():
+            return "all users"
+        users = self._selected_job_users()
+        if not users:
+            return "me"
+        return plural_label(len(users), "user")
+
+    def _job_group_summary(self) -> str:
+        groups = self._selected_job_groups()
+        if not groups:
+            return "none"
+        return plural_label(len(groups), "group")
+
+    def _read_jobs_filter_choice(
+        self,
+        win: curses.window,
+        box_height: int,
+        box_width: int,
+        label: str,
+        options: list[str],
+    ) -> str | None:
+        query = ""
+        selected = 0
+        footer = " type to filter  enter select/add  esc cancel "
+        safe_curs_set(1)
+        try:
+            while True:
+                matches = filter_choice_options(options, query)
+                if matches:
+                    selected = max(0, min(selected, len(matches) - 1))
+                else:
+                    selected = 0
+
+                win.erase()
+                win.border()
+                self._addstr(
+                    win,
+                    0,
+                    2,
+                    f" enter {label} ",
+                    self._pair(6) | curses.A_BOLD,
+                )
+                prompt = f"{label}: {query}"
+                self._addstr(win, 1, 2, prompt[: box_width - 4], self._pair(MUTED_PAIR))
+                body_height = max(1, box_height - 4)
+                if matches:
+                    first_match = max(0, selected - body_height + 1)
+                    visible_matches = matches[first_match : first_match + body_height]
+                    for row, value in enumerate(visible_matches, start=2):
+                        match_index = first_match + row - 2
+                        marker = ">" if match_index == selected else " "
+                        attr = (
+                            self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD
+                            if match_index == selected
+                            else self._pair(MUTED_PAIR)
+                        )
+                        self._addstr(
+                            win,
+                            row,
+                            2,
+                            f"{marker} {value}"[: box_width - 4],
+                            attr,
+                        )
+                elif query.strip():
+                    self._addstr(
+                        win,
+                        2,
+                        2,
+                        f'Add "{query.strip()}"'[: box_width - 4],
+                        self._pair(ACTIVE_TAB_PAIR) | curses.A_BOLD,
+                    )
+                else:
+                    self._addstr(
+                        win,
+                        2,
+                        2,
+                        "No choices.",
+                        self._pair(MUTED_PAIR),
+                    )
+                self._addstr(win, box_height - 1, 2, footer[: box_width - 4], self._pair(5))
+                win.refresh()
+
+                key = win.getch()
+                if key == 27:
+                    return None
+                if key in (ord("\n"), curses.KEY_ENTER):
+                    if matches:
+                        return matches[selected]
+                    value = query.strip()
+                    return value or None
+                if key in (curses.KEY_DOWN, ord("j")) and matches:
+                    selected = min(len(matches) - 1, selected + 1)
+                elif key in (curses.KEY_UP, ord("k")) and matches:
+                    selected = max(0, selected - 1)
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    query = query[:-1]
+                    selected = 0
+                elif key in (21,):
+                    query = ""
+                    selected = 0
+                elif 32 <= key <= 126:
+                    query += chr(key)
+                    selected = 0
+        finally:
+            safe_curs_set(0)
 
     def _show_history_filter(self, stdscr: curses.window) -> None:
         current_windows = [window for window, _ in HISTORY_FILTER_OPTIONS]
@@ -1331,6 +1996,27 @@ def command_text(fn, job_id: str) -> str:
         return fn(job_id).strip() or "No output."
     except SlurmError as exc:
         return str(exc)
+
+
+SCRIPT_STATE_PRIORITY = {
+    "RUNNING": 0,
+    "PENDING": 1,
+}
+
+
+def job_script_target_sort_key(job: Job) -> tuple[int, str]:
+    return (SCRIPT_STATE_PRIORITY.get(state_base(job.state), 2), job.job_id)
+
+
+def record_script_target_sort_key(record: JobRecord) -> tuple[int, str]:
+    return (SCRIPT_STATE_PRIORITY.get(record.base_state, 2), record.job_id)
+
+
+def filter_choice_options(options: list[str], query: str) -> list[str]:
+    stripped = query.strip().lower()
+    if not stripped:
+        return list(options)
+    return [option for option in options if stripped in option.lower()]
 
 
 def wrap_lines(text: str, width: int) -> list[str]:
@@ -1459,24 +2145,30 @@ def history_window_short_label(window: str) -> str:
     return window
 
 
-def filter_running_jobs(jobs: list[Job], *, show_completed: bool) -> list[Job]:
-    active_keys = {
-        job_group_key(job)
+def job_state_filter_label(states: str) -> str:
+    if states.lower() == "all":
+        return "all"
+    selected = {
+        state.strip().upper()
+        for state in states.split(",")
+        if state.strip()
+    }
+    if selected == set(JOB_STATE_CODES):
+        return "all selected"
+    if len(selected) > 4:
+        return f"{len(selected)} states"
+    for value, label in JOB_STATE_FILTER_OPTIONS:
+        if states == value:
+            return f"{label} ({value})"
+    return states
+
+
+def filter_running_jobs(jobs: list[Job]) -> list[Job]:
+    return [
+        job
         for job in jobs
         if job.state.upper() in {"RUNNING", "PENDING"}
-    }
-    visible: list[Job] = []
-    for job in jobs:
-        state = job.state.upper()
-        if state in {"RUNNING", "PENDING"}:
-            visible.append(job)
-        elif (
-            show_completed
-            and state == "COMPLETED"
-            and job_group_key(job) in active_keys
-        ):
-            visible.append(job)
-    return visible
+    ]
 
 
 def job_group_key(job: Job) -> tuple[str, str]:
@@ -1485,16 +2177,29 @@ def job_group_key(job: Job) -> tuple[str, str]:
 
 def responsive_job_specs(
     available_width: int,
+    *,
+    show_principals: bool = False,
 ) -> list[tuple[str, int, int, Callable[[Job], str]]]:
     specs: list[tuple[str, int, int, Callable[[Job], str]]] = [
         ("JOBID", 10, 22, lambda job: job.job_id),
+    ]
+    if show_principals:
+        specs.extend(
+            [
+                ("USER", 6, 16, lambda job: job.user or "-"),
+                ("GROUP", 6, 18, lambda job: job.group or "-"),
+            ]
+        )
+    specs.extend(
+        [
         ("STATE", 8, 14, lambda job: job.state),
         ("PARTITION", 10, 22, lambda job: job.partition),
         ("ELAPSED", 8, 14, lambda job: job.elapsed),
         ("LIMIT", 8, 14, lambda job: job.limit),
         ("CPUS", 4, 8, lambda job: job.cpus),
         ("WHERE / WHY", 18, 56, lambda job: job.location),
-    ]
+        ]
+    )
     if minimum_table_width(label_widths(specs)) <= available_width:
         return specs
 
@@ -1502,15 +2207,35 @@ def responsive_job_specs(
     if minimum_table_width(label_widths(specs)) <= available_width:
         return specs
 
-    return [spec for spec in specs if spec[0] != "CPUS"]
+    specs = [spec for spec in specs if spec[0] != "CPUS"]
+    if minimum_table_width(label_widths(specs)) <= available_width:
+        return specs
+
+    specs = [spec for spec in specs if spec[0] != "GROUP"]
+    if minimum_table_width(label_widths(specs)) <= available_width:
+        return specs
+
+    return [spec for spec in specs if spec[0] != "USER"]
 
 
 def responsive_job_group_specs(
     available_width: int,
+    *,
+    show_principals: bool = False,
 ) -> list[tuple[str, int, int, Callable[[JobRecordGroup], str]]]:
     specs: list[tuple[str, int, int, Callable[[JobRecordGroup], str]]] = [
         ("JOBID", 10, 16, lambda group: group.array_parent),
         ("JOB", 12, 28, lambda group: group.name),
+    ]
+    if show_principals:
+        specs.extend(
+            [
+                ("USER", 6, 16, lambda group: group.user or "-"),
+                ("GROUP", 6, 18, lambda group: group.group or "-"),
+            ]
+        )
+    specs.extend(
+        [
         ("REQ", 3, 5, lambda group: str(group.total)),
         ("DONE", 4, 5, lambda group: str(group.completed)),
         ("RUN", 3, 5, lambda group: str(group.running)),
@@ -1518,10 +2243,17 @@ def responsive_job_group_specs(
         ("FAIL", 4, 5, lambda group: str(group.failed)),
         ("RUN_FOR", 7, 12, lambda group: group.longest_running_elapsed),
         ("LIMIT", 8, 14, lambda group: group.limit),
-    ]
+        ]
+    )
     if minimum_table_width(label_widths(specs)) <= available_width:
         return specs
-    return [spec for spec in specs if spec[0] != "LIMIT"]
+    specs = [spec for spec in specs if spec[0] != "LIMIT"]
+    if minimum_table_width(label_widths(specs)) <= available_width:
+        return specs
+    specs = [spec for spec in specs if spec[0] != "GROUP"]
+    if minimum_table_width(label_widths(specs)) <= available_width:
+        return specs
+    return [spec for spec in specs if spec[0] != "USER"]
 
 
 def responsive_history_group_specs(
@@ -1626,3 +2358,17 @@ def safe_curs_set(visibility: int) -> None:
         curses.curs_set(visibility)
     except curses.error:
         pass
+
+
+def safe_mousemask() -> None:
+    try:
+        curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
+    except curses.error:
+        pass
+
+
+def safe_getmouse() -> tuple[int, int, int, int, int] | None:
+    try:
+        return curses.getmouse()
+    except curses.error:
+        return None

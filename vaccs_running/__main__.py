@@ -3,8 +3,20 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .slurm import SlurmClient, SlurmError
+from . import __version__
+from .slurm import SlurmClient, SlurmError, normalize_squeue_states
 from .ui import VaccsRunningApp
+
+
+def is_all_user_selector(value: str | None) -> bool:
+    return bool(value and value.strip().lower() == "all")
+
+
+def slurm_state_arg(value: str) -> str:
+    try:
+        return normalize_squeue_states(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -14,7 +26,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "-u", "--user",
-        help="Slurm username to inspect. Defaults to the current VACC shell user.",
+        help=(
+            "Slurm username to inspect, or 'all' to inspect all users. "
+            "Defaults to the current VACC shell user."
+        ),
     )
     parser.add_argument(
         "-r", "--refresh",
@@ -22,12 +37,39 @@ def build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="Auto-refresh interval in seconds. Use 0 to disable. Default: 2.0.",
     )
+    parser.add_argument(
+        "-s",
+        "--state",
+        "--states",
+        dest="states",
+        type=slurm_state_arg,
+        default="all",
+        help=(
+            "Comma-separated Slurm states passed to squeue -t for the jobs view, "
+            "for example PD or RUNNING,PENDING. Default: all."
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
     return parser
+
+
+def make_client(user: str | None, states: str) -> SlurmClient:
+    client = SlurmClient(
+        user=None if is_all_user_selector(user) else user,
+        states=states,
+    )
+    if is_all_user_selector(user):
+        client.set_job_user_filter(user)
+    return client
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    client = SlurmClient(user=args.user)
+    client = make_client(args.user, args.states)
 
     try:
         VaccsRunningApp(

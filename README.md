@@ -33,6 +33,27 @@ that:
 ./vaccs-running --refresh 1
 ```
 
+To prefilter the Jobs view by Slurm state, pass the state list through to
+`squeue`:
+
+```bash
+./vaccs-running --state PD
+./vaccs-running --states RUNNING,PENDING
+./vaccs-running --user all --state PD
+```
+
+Inside the Running view, press `s` to see the selected job's sbatch script.
+Press `f` to change the live filter. The filter popup lets you click or press
+Enter/Space to select multiple states, users, and groups. It lists users and
+groups from currently running jobs. Custom user/group entry works as a
+typeahead: typing narrows the choices, Enter selects the highlighted match, and
+Enter adds the typed value for this session when no choices match. Use `c` to
+clear the active filter. With no user/group selected, the Running view falls
+back to your own user. In the status filter, Space/Enter toggles individual
+statuses, and selecting no statuses means all statuses. When the Running view
+can show jobs from multiple users, the table includes user and group columns.
+If both user and group filters are selected, the group filter takes priority.
+
 > ⚠️  As auto-refresh queries Slurm, please use an interval larger than 1 second.
 
 ## Install As A Command

@@ -1,8 +1,10 @@
 import unittest
 
 from vaccs_running.slurm import (
+    FILTER_CHOICES_FORMAT,
     SACCT_FORMAT,
     NODE_JOBS_FORMAT,
+    SQUEUE_FORMAT,
     SlurmClient,
     aggregate_user_usage,
     format_node_jobs,
@@ -21,6 +23,7 @@ from vaccs_running.slurm import (
     parse_gpu_count,
     parse_memory_mb,
     parse_tres_value,
+    normalize_squeue_states,
     summarize_jobs,
 )
 
@@ -44,7 +47,7 @@ class FakeRunner:
 
 class SlurmParsingTests(unittest.TestCase):
     def test_fetch_jobs_expands_array_tasks(self):
-        client = SlurmClient(user="dgezgin")
+        client = SlurmClient(user="testuser")
         fake_runner = FakeRunner()
         client.runner = fake_runner
 
@@ -56,16 +59,240 @@ class SlurmParsingTests(unittest.TestCase):
                 "--array",
                 "-h",
                 "-u",
-                "dgezgin",
+                "testuser",
                 "-t",
                 "all",
                 "-o",
-                "%i|%j|%T|%P|%N|%R|%M|%l|%D|%C|%b|%V|%S",
+                SQUEUE_FORMAT,
+            ],
+        )
+
+    def test_fetch_jobs_passes_requested_state_filter_to_squeue(self):
+        client = SlurmClient(user="testuser", states="pd, running")
+        fake_runner = FakeRunner()
+        client.runner = fake_runner
+
+        self.assertEqual(client.fetch_jobs(), [])
+
+        self.assertEqual(client.squeue_states, "PD,RUNNING")
+        self.assertEqual(
+            fake_runner.calls[0][0],
+            [
+                "squeue",
+                "--array",
+                "-h",
+                "-u",
+                "testuser",
+                "-t",
+                "PD,RUNNING",
+                "-o",
+                SQUEUE_FORMAT,
+            ],
+        )
+
+    def test_fetch_jobs_can_query_all_users(self):
+        client = SlurmClient(user="testuser")
+        client.set_job_user_filter("all")
+        fake_runner = FakeRunner()
+        client.runner = fake_runner
+
+        self.assertEqual(client.fetch_jobs(), [])
+
+        self.assertEqual(
+            fake_runner.calls[0][0],
+            [
+                "squeue",
+                "--array",
+                "-h",
+                "-t",
+                "all",
+                "-o",
+                SQUEUE_FORMAT,
+            ],
+        )
+
+    def test_normalize_squeue_states_accepts_all_or_comma_list(self):
+        self.assertEqual(normalize_squeue_states(None), "all")
+        self.assertEqual(normalize_squeue_states("all"), "all")
+        self.assertEqual(normalize_squeue_states("'PD', R"), "PD,R")
+        with self.assertRaises(ValueError):
+            normalize_squeue_states("PD;RUNNING")
+
+    def test_state_prefiltered_jobs_skip_accounting_expansion(self):
+        client = SlurmClient(user="testuser", states="PD")
+        fake_runner = FakeRunner(
+            "4492653_42|direct-xcon-nsga2|PENDING|nvgpu||"
+            "(Resources)|0:00|2-00:00:00|1|4|N/A|"
+            "2026-06-28T08:37:36|2026-06-28T16:53:08\n"
+        )
+        client.runner = fake_runner
+
+        jobs, records = client.fetch_active_job_records()
+
+        self.assertEqual(len(fake_runner.calls), 1)
+        self.assertEqual([job.job_id for job in jobs], ["4492653_42"])
+        self.assertEqual([record.job_id for record in records], ["4492653_42"])
+        self.assertEqual(records[0].source, "squeue")
+
+    def test_user_prefiltered_jobs_skip_accounting_expansion(self):
+        client = SlurmClient(user="testuser")
+        client.set_job_user_filter("other")
+        fake_runner = FakeRunner(
+            "4492653_42|direct-xcon-nsga2|PENDING|nvgpu||"
+            "(Resources)|0:00|2-00:00:00|1|4|N/A|"
+            "2026-06-28T08:37:36|2026-06-28T16:53:08\n"
+        )
+        client.runner = fake_runner
+
+        jobs, records = client.fetch_active_job_records()
+
+        self.assertEqual(len(fake_runner.calls), 1)
+        self.assertIn("-u", fake_runner.calls[0][0])
+        self.assertEqual(
+            fake_runner.calls[0][0][fake_runner.calls[0][0].index("-u") + 1],
+            "other",
+        )
+        self.assertEqual([job.job_id for job in jobs], ["4492653_42"])
+        self.assertEqual([record.job_id for record in records], ["4492653_42"])
+        self.assertEqual(records[0].source, "squeue")
+
+    def test_group_prefilter_fetches_broadly_and_filters_locally(self):
+        client = SlurmClient(user="testuser")
+        client.set_job_principal_filters(groups={"pi-example"})
+        fake_runner = FakeRunner(
+            "1|keep|RUNNING|nvgpu|node01|None|1:00|2:00|1|4|N/A|"
+            "2026-06-28T08:37:36|2026-06-28T08:41:26|alice|pi-example\n"
+            "2|drop|RUNNING|nvgpu|node02|None|1:00|2:00|1|4|N/A|"
+            "2026-06-28T08:37:36|2026-06-28T08:41:26|bob|pi-other\n"
+        )
+        client.runner = fake_runner
+
+        jobs = client.fetch_jobs()
+
+        self.assertNotIn("-u", fake_runner.calls[0][0])
+        self.assertEqual([job.job_id for job in jobs], ["1"])
+        self.assertEqual(jobs[0].group, "pi-example")
+
+    def test_group_filter_takes_priority_over_selected_users(self):
+        client = SlurmClient(user="testuser")
+        client.set_job_principal_filters(
+            users={"alice", "bob", "carol"},
+            groups={"pi-example"},
+        )
+        fake_runner = FakeRunner(
+            "1|drop-alice|RUNNING|nvgpu|node01|None|1:00|2:00|1|4|N/A|"
+            "2026-06-28T08:37:36|2026-06-28T08:41:26|alice|pi-other\n"
+            "2|drop-bob|RUNNING|nvgpu|node02|None|1:00|2:00|1|4|N/A|"
+            "2026-06-28T08:37:36|2026-06-28T08:41:26|bob|pi-other\n"
+            "3|keep-carol|RUNNING|nvgpu|node03|None|1:00|2:00|1|4|N/A|"
+            "2026-06-28T08:37:36|2026-06-28T08:41:26|carol|pi-example\n"
+        )
+        client.runner = fake_runner
+
+        jobs = client.fetch_jobs()
+
+        self.assertNotIn("-u", fake_runner.calls[0][0])
+        self.assertEqual([job.job_id for job in jobs], ["3"])
+        self.assertEqual(jobs[0].user, "carol")
+        self.assertEqual(jobs[0].group, "pi-example")
+
+    def test_empty_principal_selection_defaults_to_configured_user(self):
+        client = SlurmClient(user="testuser")
+        client.set_job_principal_filters(users=set(), groups=set())
+        fake_runner = FakeRunner()
+        client.runner = fake_runner
+
+        self.assertEqual(client.fetch_jobs(), [])
+
+        self.assertIn("-u", fake_runner.calls[0][0])
+        self.assertEqual(
+            fake_runner.calls[0][0][fake_runner.calls[0][0].index("-u") + 1],
+            "testuser",
+        )
+
+    def test_fetch_running_filter_choices_lists_running_users_and_groups(self):
+        client = SlurmClient(user="testuser")
+        fake_runner = FakeRunner(
+            "alice|pi-example\n"
+            "alice|pi-example\n"
+            "bob|pi-other\n"
+        )
+        client.runner = fake_runner
+
+        choices = client.fetch_running_filter_choices()
+
+        self.assertEqual(
+            fake_runner.calls[0][0],
+            [
+                "squeue",
+                "--array",
+                "-h",
+                "-t",
+                "R",
+                "-o",
+                FILTER_CHOICES_FORMAT,
+            ],
+        )
+        self.assertEqual(choices.users, ["alice", "bob"])
+        self.assertEqual(choices.groups, ["pi-example", "pi-other"])
+
+    def test_history_uses_unfiltered_squeue_snapshot(self):
+        client = SlurmClient(user="testuser", states="PD")
+        fake_runner = FakeRunner(
+            [
+                (
+                    "4492653_3|direct-xcon-nsga2|RUNNING|nvgpu|h2node05|"
+                    "h2node05|00:10:00|2-00:00:00|1|4|gpu:h200:1|"
+                    "2026-06-28T08:37:36|2026-06-28T08:41:26\n"
+                ),
+                "",
+            ]
+        )
+        client.runner = fake_runner
+
+        records = client.fetch_job_history("3h")
+
+        self.assertEqual(
+            fake_runner.calls[0][0],
+            [
+                "squeue",
+                "--array",
+                "-h",
+                "-u",
+                "testuser",
+                "-t",
+                "all",
+                "-o",
+                SQUEUE_FORMAT,
+            ],
+        )
+        self.assertEqual([record.job_id for record in records], ["4492653_3"])
+
+    def test_history_uses_default_user_when_jobs_filter_is_all_users(self):
+        client = SlurmClient(user="testuser")
+        client.set_job_user_filter("all")
+        fake_runner = FakeRunner(["", ""])
+        client.runner = fake_runner
+
+        self.assertEqual(client.fetch_job_history("3h"), [])
+
+        self.assertEqual(
+            fake_runner.calls[0][0],
+            [
+                "squeue",
+                "--array",
+                "-h",
+                "-u",
+                "testuser",
+                "-t",
+                "all",
+                "-o",
+                SQUEUE_FORMAT,
             ],
         )
 
     def test_fetch_job_history_merges_sacct_with_current_squeue_rows(self):
-        client = SlurmClient(user="dgezgin")
+        client = SlurmClient(user="testuser")
         fake_runner = FakeRunner(
             [
                 (
@@ -98,7 +325,7 @@ class SlurmParsingTests(unittest.TestCase):
                 "-X",
                 "--array",
                 "-u",
-                "dgezgin",
+                "testuser",
                 "-S",
                 "now-3hours",
                 "-o",
@@ -114,7 +341,7 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertEqual(pending.location, "pending: (Resources)")
 
     def test_fetch_active_job_records_counts_completed_accounting_siblings(self):
-        client = SlurmClient(user="dgezgin")
+        client = SlurmClient(user="testuser")
         fake_runner = FakeRunner(
             [
                 (
@@ -160,7 +387,7 @@ class SlurmParsingTests(unittest.TestCase):
                 "-X",
                 "--array",
                 "-u",
-                "dgezgin",
+                "testuser",
                 "-S",
                 "2026-06-28T08:37:36",
                 "-o",
@@ -404,9 +631,9 @@ NodeName=gpudebug01 Arch=x86_64 CoresPerSocket=64
         self.assertEqual(free_gpu_count(nodes), 3)
 
     def test_node_jobs_queries_selected_node(self):
-        client = SlurmClient(user="dgezgin")
+        client = SlurmClient(user="testuser")
         fake_runner = FakeRunner(
-            "4341591_1|dgezgin|RUNNING|12:34|4|gpu:h200:1|train\n"
+            "4341591_1|testuser|RUNNING|12:34|4|gpu:h200:1|train\n"
         )
         client.runner = fake_runner
 
@@ -418,21 +645,34 @@ NodeName=gpudebug01 Arch=x86_64 CoresPerSocket=64
         )
         self.assertIn("JOBID", output)
         self.assertIn("USER", output)
-        self.assertIn("dgezgin", output)
+        self.assertIn("testuser", output)
         self.assertIn("train", output)
 
+    def test_show_job_script_writes_batch_script_to_stdout(self):
+        client = SlurmClient(user="testuser")
+        fake_runner = FakeRunner("#!/bin/bash\n#SBATCH --job-name=train\n")
+        client.runner = fake_runner
+
+        output = client.show_job_script("4341591")
+
+        self.assertEqual(
+            fake_runner.calls[0][0],
+            ["scontrol", "write", "batch_script", "4341591", "-"],
+        )
+        self.assertEqual(output, "#!/bin/bash\n#SBATCH --job-name=train\n")
+
     def test_node_jobs_reports_empty_node(self):
-        client = SlurmClient(user="dgezgin")
+        client = SlurmClient(user="testuser")
         client.runner = FakeRunner("")
 
         self.assertEqual(client.node_jobs("h2node01"), "No jobs found on h2node01.")
 
     def test_cluster_usage_queries_running_tasks_across_all_nodes(self):
-        client = SlurmClient(user="dgezgin")
+        client = SlurmClient(user="testuser")
         fake_runner = FakeRunner(
             [
                 """JobId=4341591 ArrayJobId=4341591 ArrayTaskId=1 JobName=train
-   UserId=dgezgin(512550) GroupId=pi-ncheney(170095)
+   UserId=testuser(512550) GroupId=pi-ncheney(170095)
    JobState=RUNNING Reason=None Dependency=(null)
    NumCPUs=4 ReqTRES=cpu=4,mem=16G,node=1,billing=4,gres/gpu=1
    AllocTRES=cpu=4,mem=16G,node=1,billing=4,gres/gpu=1
@@ -472,31 +712,31 @@ NodeName=h2node01 Arch=x86_64 CoresPerSocket=96
             ["scontrol", "show", "node"],
         )
         self.assertIn("2 people running 2 tasks", output)
-        self.assertIn("dgezgin", output)
+        self.assertIn("testuser", output)
         self.assertIn("other", output)
         self.assertIn("TOTAL", output)
         self.assertRegex(output, r"(?m)^FREE\s+-\s+-\s+3")
 
     def test_parse_node_job_line_strips_fields(self):
         job = parse_node_job_line(
-            " 4341679_19 | dgezgin | RUNNING | 44:18 | 4 | N/A | lcb-ant-omni-lr "
+            " 4341679_19 | testuser | RUNNING | 44:18 | 4 | N/A | lcb-ant-omni-lr "
         )
 
         self.assertEqual(job["job_id"], "4341679_19")
-        self.assertEqual(job["user"], "dgezgin")
+        self.assertEqual(job["user"], "testuser")
         self.assertEqual(job["state"], "RUNNING")
         self.assertEqual(job["name"], "lcb-ant-omni-lr")
 
     def test_format_node_jobs_aligns_rows(self):
         text = format_node_jobs(
             [
-                parse_node_job_line("4341591_66|dgezgin|RUNNING|58:18|4|N/A|lcb-ant-lr"),
-                parse_node_job_line("4341679_19|dgezgin|RUNNING|44:18|4|N/A|lcb-ant-omni-lr"),
+                parse_node_job_line("4341591_66|testuser|RUNNING|58:18|4|N/A|lcb-ant-lr"),
+                parse_node_job_line("4341679_19|testuser|RUNNING|44:18|4|N/A|lcb-ant-omni-lr"),
             ]
         )
         lines = text.splitlines()
 
-        self.assertEqual(lines[0].index("USER"), lines[2].index("dgezgin"))
+        self.assertEqual(lines[0].index("USER"), lines[2].index("testuser"))
         self.assertEqual(lines[0].index("STATE"), lines[2].index("RUNNING"))
         self.assertEqual(lines[0].rindex("JOB"), lines[2].index("lcb-ant-lr"))
 
@@ -640,13 +880,13 @@ NodeName=h2node01 Arch=x86_64 CoresPerSocket=96
     def test_parse_scontrol_job_usage_counts_running_alloc_tres(self):
         usage = parse_scontrol_job_usage(
             """JobId=4414236 ArrayJobId=4413548 ArrayTaskId=235 JobName=ae-pert-cand
-   UserId=dgezgin(512550) GroupId=pi-ncheney(170095)
+   UserId=testuser(512550) GroupId=pi-ncheney(170095)
    JobState=RUNNING Reason=None Dependency=(null)
    NumCPUs=4 NumTasks=1 CPUs/Task=4
    ReqTRES=cpu=4,mem=64G,node=1,billing=4,gres/gpu=1
    AllocTRES=cpu=4,mem=64G,node=1,billing=4,gres/gpu=1
 JobId=4414192 ArrayJobId=4413548 ArrayTaskId=214 JobName=ae-pert-cand
-   UserId=dgezgin(512550) GroupId=pi-ncheney(170095)
+   UserId=testuser(512550) GroupId=pi-ncheney(170095)
    JobState=COMPLETED Reason=None Dependency=(null)
    NumCPUs=4 NumTasks=1 CPUs/Task=4
    ReqTRES=cpu=4,mem=64G,node=1,billing=4,gres/gpu=1
@@ -659,7 +899,7 @@ JobId=4414192 ArrayJobId=4413548 ArrayTaskId=214 JobName=ae-pert-cand
             [
                 {
                     "job_id": "4414236",
-                    "user": "dgezgin",
+                    "user": "testuser",
                     "cpus": "4",
                     "tres": "cpu=4,mem=64G,node=1,billing=4,gres/gpu=1",
                     "memory": "64G",
